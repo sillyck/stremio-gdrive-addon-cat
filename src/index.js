@@ -38,10 +38,29 @@ const CONFIG = {
         titleName: "name",
     },
     driveFolderIds: [],
+
+    // ── Catàleg de "col·leccions" propi (afegit per gestionar carpetes amb
+    // noms/estructura inconsistents que no segueixen convencions Sxx/Eyy) ──
+    // Cada subcarpeta DIRECTA d'aquests ids es mostra com una sèrie pròpia al
+    // catàleg. El contingut de cada subcarpeta es recorre en viu a cada
+    // petició de meta, així que sèries/episodis nous apareixen sols sense
+    // haver de tocar aquesta llista.
+    enableCollectionsCatalog: true,
+    // "Pelis" (té subcarpetes que són sèries, ex. Bola de Drac, One Piece) i
+    // "Series" (unitat compartida "Animelliure t7").
+    collectionsRootFolderIds: [
+        "1G8ZZTxqrsx1bU-oDf-IyLRnLUVPSxYo-", // Pelis
+        "1gFvLogJwAqobE_7Km4uC6zEkt-FyOEC3", // Series
+    ],
+    // Carpetes de les quals els arxius DIRECTES (no dins subcarpetes) es
+    // mostren com a pel·lícules soltes al catàleg "gdrive_list" existent.
+    moviesFolderIds: [
+        "1G8ZZTxqrsx1bU-oDf-IyLRnLUVPSxYo-", // Pelis
+    ],
 };
 
 const MANIFEST = {
-    id: "stremio.gdrive.worker",
+    id: "stremio.gdrive.worker.cat",
     version: "1.0.0",
     name: CONFIG.addonName,
     description: "Stream your files from Google Drive within Stremio!",
@@ -79,8 +98,8 @@ const REGEX_PATTERNS = {
     validStreamRequest: /\/stream\/(movie|series)\/([a-zA-Z0-9%:\-_]+)\.json/,
     validPlaybackRequest: /\/playback\/([a-zA-Z0-9%:\-_]+)\/(.+)/,
     validCatalogRequest:
-        /\/catalog\/movie\/([a-zA-Z0-9%:\-_]+)(\/search=(.+))?\.json/,
-    validMetaRequest: /\/meta\/(movie)\/([a-zA-Z0-9%:\-_]+)\.json/,
+        /\/catalog\/(movie|series)\/([a-zA-Z0-9%:\-_]+)(\/search=(.+))?\.json/,
+    validMetaRequest: /\/meta\/(movie|series)\/([a-zA-Z0-9%:\-_]+)\.json/,
     resolutions: {
         "2160p": /(?<![^ [(_\-.])(4k|2160p|uhd)(?=[ \)\]_.-]|$)/i,
         "1080p": /(?<![^ [(_\-.])(1080p|fhd)(?=[ \)\]_.-]|$)/i,
@@ -847,6 +866,190 @@ async function fetchFile(fileId, accessToken) {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  CATÀLEG DE "COL·LECCIONS" — carpetes amb episodis sense convenció fiable
+//  de nom (Sxx/Eyy). En lloc de buscar per text a l'hora de reproduir, es
+//  recorre la carpeta un cop en construir el meta i es guarda directament
+//  l'id del fitxer de Drive a cada episodi — el stream es resol després pel
+//  camí "gdrive:<fileId>" ja existent, sense necessitat de cap cerca.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const FOLDER_MIME = "application/vnd.google-apps.folder";
+const VIDEO_EXT_REGEX = /\.(mkv|mp4|avi|m4v|mov|wmv|ts)$/i;
+
+async function listChildren(folderId, accessToken, { onlyFolders = false, onlyFiles = false } = {}) {
+    let q = `'${folderId}' in parents and trashed = false`;
+    if (onlyFolders) q += ` and mimeType = '${FOLDER_MIME}'`;
+    if (onlyFiles) q += ` and mimeType != '${FOLDER_MIME}'`;
+
+    const items = [];
+    let pageToken;
+    do {
+        const fetchUrl = new URL(API_ENDPOINTS.DRIVE_FETCH_FILES);
+        const params = {
+            q,
+            corpora: "allDrives",
+            includeItemsFromAllDrives: "true",
+            supportsAllDrives: "true",
+            pageSize: "1000",
+            // name_natural: ordenació alfanumèrica "natural" (ex. "2" abans
+            // que "10"), imprescindible perquè l'assignació de temporada/
+            // episodi no depengui de l'ordre arbitrari que dona Drive per
+            // defecte quan no s'especifica orderBy.
+            orderBy: "name_natural",
+            fields: "nextPageToken,files(id,name,mimeType,size,videoMediaMetadata,fileExtension,thumbnailLink,createdTime)",
+        };
+        if (pageToken) params.pageToken = pageToken;
+        fetchUrl.search = new URLSearchParams(params).toString();
+
+        const response = await fetch(fetchUrl.toString(), {
+            headers: { Authorization: `Bearer ${accessToken}` },
+        });
+        if (!response.ok) {
+            const err = await response.text();
+            throw new Error(err);
+        }
+        const data = await response.json();
+        items.push(...(data.files || []));
+        pageToken = data.nextPageToken;
+    } while (pageToken);
+
+    return items;
+}
+
+async function walkCollectionFiles(rootFolderId, accessToken, maxDepth = 6) {
+    const resultats = [];
+
+    async function recorre(folderId, ruta, profunditat) {
+        if (profunditat > maxDepth) return;
+        const fills = await listChildren(folderId, accessToken);
+        for (const item of fills) {
+            if (item.mimeType === FOLDER_MIME) {
+                await recorre(item.id, [...ruta, item.name], profunditat + 1);
+            } else if (VIDEO_EXT_REGEX.test(item.name)) {
+                resultats.push({ file: item, ruta: [...ruta, item.name] });
+            }
+        }
+    }
+
+    await recorre(rootFolderId, [], 0);
+    return resultats;
+}
+
+const SXE_REGEX = /s(\d{1,2})[ ._-]?e(\d{1,3})/i;
+const NXM_REGEX = /(\d{1,2})x(\d{1,3})/i;
+const NUMERO_PLA_REGEX = /(\d{2,4})(?!\d)/;
+
+function extreuNumeroEpisodi(nomArxiu) {
+    let m = SXE_REGEX.exec(nomArxiu);
+    if (m) return { season: parseInt(m[1], 10), episode: parseInt(m[2], 10), font: "SxE" };
+    m = NXM_REGEX.exec(nomArxiu);
+    if (m) return { season: parseInt(m[1], 10), episode: parseInt(m[2], 10), font: "NxM" };
+    m = NUMERO_PLA_REGEX.exec(nomArxiu);
+    if (m) return { season: null, episode: parseInt(m[1], 10), font: "pla" };
+    return null;
+}
+
+// Treu el primer número que apareix en un nom de carpeta (ex. "Saga 02" -> 2,
+// "Temporada 10" -> 10), per poder ordenar sagues/temporades correctament en
+// lloc de dependre de l'ordre en què Drive les ha retornat.
+function primerNumeroDe(text) {
+    const m = /(\d{1,3})/.exec(text);
+    return m ? parseInt(m[1], 10) : null;
+}
+
+function assignaEpisodis(fitxersRuta) {
+    const ambNumero = [];
+    const senseNumero = [];
+
+    for (const item of fitxersRuta) {
+        const nomArxiu = item.ruta[item.ruta.length - 1];
+        const info = extreuNumeroEpisodi(nomArxiu);
+        if (info) {
+            ambNumero.push({ ...item, ...info });
+        } else {
+            senseNumero.push({ ...item, season: null, episode: null, font: "cap" });
+        }
+    }
+
+    const ambSxE = ambNumero.filter((i) => i.font !== "pla");
+    let episodis = [];
+
+    if (ambNumero.length > 0 && ambSxE.length >= ambNumero.length * 0.5) {
+        // Majoria amb format Sxx/Eyy explícit: fem servir season/episode tal
+        // qual (season pot ser 0 per a "especials" — no ho col·lapsem a 1).
+        // Els que només tenen número pla (minoria) es posen a temporada 1
+        // al final, amb un número d'episodi alt perquè no col·lisionin.
+        episodis = ambNumero
+            .concat(senseNumero.map((i, idx) => ({ ...i, season: 1, episode: 9000 + idx })))
+            .map((i) => ({
+                file: i.file,
+                season: i.season != null ? i.season : 1,
+                episode: i.episode,
+                title: i.ruta[i.ruta.length - 1],
+            }));
+    } else {
+        // Numeració plana o inexistent: agrupem per la carpeta CONTENIDORA
+        // real de cada arxiu (ruta sencera menys el nom de fitxer, no només
+        // el primer nivell) — així funciona igual si els episodis són
+        // directament dins la carpeta de la sèrie, o a qualsevol profunditat
+        // (ex. "Bola de Drac [qualitat]/Saga 01/episodi.mkv": la clau
+        // d'agrupació és "Bola de Drac [qualitat]/Saga 01", no només
+        // "Bola de Drac [qualitat]", que agruparia totes les sagues juntes).
+        const grups = new Map();
+        for (const item of ambNumero.concat(senseNumero)) {
+            const clau =
+                item.ruta.length > 1
+                    ? item.ruta.slice(0, -1).join("/")
+                    : "__ARREL__";
+            if (!grups.has(clau)) grups.set(clau, []);
+            grups.get(clau).push(item);
+        }
+
+        // Ordenem els grups pel número que trobem al nom de la seva carpeta
+        // (ex. "Saga 01" abans que "Saga 02"), i si cap no en té, alfabètic.
+        const clausOrdenades = [...grups.keys()].sort((a, b) => {
+            const nomA = a === "__ARREL__" ? "" : a.split("/").pop();
+            const nomB = b === "__ARREL__" ? "" : b.split("/").pop();
+            const numA = primerNumeroDe(nomA);
+            const numB = primerNumeroDe(nomB);
+            if (numA != null && numB != null && numA !== numB) return numA - numB;
+            if (numA != null && numB == null) return -1;
+            if (numA == null && numB != null) return 1;
+            return nomA.localeCompare(nomB);
+        });
+
+        let numTemporada = 1;
+        for (const clau of clausOrdenades) {
+            const itemsGrup = grups.get(clau);
+            itemsGrup.sort((a, b) => {
+                if (a.episode != null && b.episode != null) return a.episode - b.episode;
+                if (a.episode != null) return -1;
+                if (b.episode != null) return 1;
+                return a.ruta[a.ruta.length - 1].localeCompare(b.ruta[b.ruta.length - 1]);
+            });
+            // Conservem el número d'episodi real quan el tenim (evita que
+            // afegir un episodi antic reordeni els números de tots els
+            // altres al proper refresc); només inventem un número seqüencial
+            // pels que no en tenen cap.
+            let seguentSenseNumero =
+                Math.max(0, ...itemsGrup.map((i) => i.episode).filter((e) => e != null)) + 1;
+            itemsGrup.forEach((item) => {
+                const numEpisodi = item.episode != null ? item.episode : seguentSenseNumero++;
+                episodis.push({
+                    file: item.file,
+                    season: numTemporada,
+                    episode: numEpisodi,
+                    title: item.ruta[item.ruta.length - 1],
+                });
+            });
+            numTemporada++;
+        }
+    }
+
+    return episodis;
+}
+
 function buildBaseSearchQuery(query) {
     query = query.replace(/'/g, "\\'");
     let q = `name contains '${query}' and trashed=false and not name contains 'trailer' and not name contains 'sample'`;
@@ -976,15 +1179,30 @@ async function handleRequest(request) {
                     ],
                 });
             }
-            if (CONFIG.enableVideoCatalog || CONFIG.enableSearchCatalog) {
+            if (
+                CONFIG.enableCollectionsCatalog &&
+                CONFIG.collectionsRootFolderIds &&
+                CONFIG.collectionsRootFolderIds.length > 0
+            ) {
+                manifest.catalogs.push({
+                    type: "series",
+                    id: "gdrive_collections",
+                    name: "Col·leccions",
+                });
+            }
+            if (
+                CONFIG.enableVideoCatalog ||
+                CONFIG.enableSearchCatalog ||
+                CONFIG.enableCollectionsCatalog
+            ) {
                 manifest.resources.push({
                     name: "catalog",
-                    types: ["movie"],
+                    types: ["movie", "series"],
                 });
                 manifest.resources.push({
                     name: "meta",
                     types: ["movie", "series", "anime"],
-                    idPrefixes: ["gdrive:"],
+                    idPrefixes: ["gdrive:", "gdriveshow:"],
                 });
             }
             return createJsonResponse(manifest);
@@ -1050,15 +1268,65 @@ async function handleRequest(request) {
         });
 
         if (metaMatch) {
-            const fileId = metaMatch[2];
-            if (!fileId) {
+            const fullMetaId = metaMatch[2];
+            if (!fullMetaId) {
                 console.error({
                     message: "Failed to extract file ID",
                     error: "File ID is undefined",
                 });
                 return null;
             }
-            const gdriveId = fileId.split(":")[1];
+
+            if (fullMetaId.startsWith("gdriveshow:")) {
+                const folderId = fullMetaId.split(":")[1];
+                const accessToken = await getAccessToken();
+                if (!accessToken) {
+                    console.error({
+                        message: "Failed to get access token",
+                        error: "Access token is undefined",
+                    });
+                    return null;
+                }
+                console.log({ message: "Collection meta request", folderId });
+                let folderInfo;
+                let fitxersRuta;
+                try {
+                    [folderInfo, fitxersRuta] = await Promise.all([
+                        fetchFile(folderId, accessToken),
+                        walkCollectionFiles(folderId, accessToken),
+                    ]);
+                } catch (error) {
+                    console.error({
+                        message: "Failed to walk collection folder",
+                        error: error.toString(),
+                    });
+                    return createJsonResponse({ meta: null }, 500);
+                }
+                const episodis = assignaEpisodis(fitxersRuta);
+                const videos = episodis.map((ep) => ({
+                    id: `gdrive:${ep.file.id}`,
+                    season: ep.season,
+                    episode: ep.episode,
+                    title: ep.title,
+                    released: ep.file.createdTime || undefined,
+                }));
+                console.log({
+                    message: "Collection meta built",
+                    folderId,
+                    numVideos: videos.length,
+                });
+                return createJsonResponse({
+                    meta: {
+                        id: fullMetaId,
+                        type: "series",
+                        name: folderInfo?.name || "Col·lecció",
+                        posterShape: "poster",
+                        videos,
+                    },
+                });
+            }
+
+            const gdriveId = fullMetaId.split(":")[1];
             const accessToken = await getAccessToken();
             if (!accessToken) {
                 console.error({
@@ -1067,7 +1335,7 @@ async function handleRequest(request) {
                 });
                 return null;
             }
-            console.log({ message: "Meta request", fileId, gdriveId });
+            console.log({ message: "Meta request", fullMetaId, gdriveId });
             const file = await fetchFile(gdriveId, accessToken);
             if (!file) {
                 console.error({
@@ -1091,19 +1359,58 @@ async function handleRequest(request) {
 
         if (catalogMatch) {
             // handle catalogs
-            const catalogId = catalogMatch[1];
-            const searchQuery = catalogMatch[2];
+            const catalogId = catalogMatch[2];
+            const searchQuery = catalogMatch[3];
             const searchTerm = searchQuery ? searchQuery.split("=")[1] : null;
 
             console.log({ message: "Catalog request", catalogId, searchTerm });
+
+            if (catalogId === "gdrive_collections") {
+                const accessToken = await getAccessToken();
+                if (!accessToken) {
+                    return createJsonResponse({
+                        error: "Invalid Credentials\nEnable and check the logs for more information\nClick for setup instructions",
+                    });
+                }
+                const metas = [];
+                try {
+                    for (const rootId of CONFIG.collectionsRootFolderIds) {
+                        const subfolders = await listChildren(rootId, accessToken, {
+                            onlyFolders: true,
+                        });
+                        for (const folder of subfolders) {
+                            metas.push({
+                                id: `gdriveshow:${folder.id}`,
+                                type: "series",
+                                name: folder.name,
+                                posterShape: "poster",
+                            });
+                        }
+                    }
+                } catch (error) {
+                    console.error({
+                        message: "Failed to list collections",
+                        error: error.toString(),
+                    });
+                }
+                console.log({
+                    message: "Collections catalog response",
+                    numMetas: metas.length,
+                });
+                return createJsonResponse({ metas });
+            }
 
             if (catalogId === "gdrive_list") {
                 const parts = [
                     "trashed=false",
                     "mimeType contains 'video/'"
                 ];
-                if (CONFIG.driveFolderIds && CONFIG.driveFolderIds.length > 0) {
-                    const ors = CONFIG.driveFolderIds.map(id => `'${id}' in parents`);
+                const movieFolderIds =
+                    CONFIG.moviesFolderIds && CONFIG.moviesFolderIds.length > 0
+                        ? CONFIG.moviesFolderIds
+                        : CONFIG.driveFolderIds;
+                if (movieFolderIds && movieFolderIds.length > 0) {
+                    const ors = movieFolderIds.map(id => `'${id}' in parents`);
                     parts.push(`(${ors.join(" or ")})`);
                 }
 
