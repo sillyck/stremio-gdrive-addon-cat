@@ -49,7 +49,6 @@ const CONFIG = {
     // "Pelis" (té subcarpetes que són sèries, ex. Bola de Drac, One Piece) i
     // "Series" (unitat compartida "Animelliure t7").
     collectionsRootFolderIds: [
-        "1G8ZZTxqrsx1bU-oDf-IyLRnLUVPSxYo-", // Pelis
         "1gFvLogJwAqobE_7Km4uC6zEkt-FyOEC3", // Series
     ],
     // Carpetes de les quals els arxius DIRECTES (no dins subcarpetes) es
@@ -701,19 +700,65 @@ async function getTmdbMeta(type, id) {
 async function getTmdbPosterByName(name) {
     if (!CONFIG.tmdbApiKey) return null;
     try {
-        const cleanName = name.replace(/[\[\(].*?[\]\)]/g, "").replace(/\d{4}/, "").trim();
-        const url = API_ENDPOINTS.TMDB_SEARCH
-            .replace("{apiKey}", CONFIG.tmdbApiKey)
-            .replace("{query}", encodeURIComponent(cleanName));
-        const response = await fetch(url);
-        if (!response.ok) return null;
-        const data = await response.json();
-        const result = data.results?.[0];
-        if (!result) return null;
-        return {
-            poster: result.poster_path ? `https://image.tmdb.org/t/p/w500${result.poster_path}` : null,
-            background: result.backdrop_path ? `https://image.tmdb.org/t/p/w1280${result.backdrop_path}` : null,
-        };
+        // 1. Extreure títol original entre parèntesis si existeix i sembla un títol real
+        //    Ex: "Blau (Ai Yori Aoshi) (2002) [cat-jap]" → "Ai Yori Aoshi"
+        const originalTitleMatch = name.match(/\(([A-Z][A-Za-z][\w\s:!?'&\-,.]{2,})\)/);
+        // Descartar si sembla tècnic (conté FLAC, DTS, cat, etc.)
+        const originalTitle = originalTitleMatch && 
+            !/(?:FLAC|DTS|cat|esp|eng|jap|val|cas|mal|sub|dub|BD|HD|AVC)/i.test(originalTitleMatch[1])
+            ? originalTitleMatch[1].trim() : null;
+        
+        // 2. Netejar nom: treure claudàtors, parèntesis amb any/codecs, extensions
+        let cleanedName = name
+            .replace(/\.[a-z0-9]{3,4}$/i, "")           // extensió (.mkv, .mp4, .avi)
+            .replace(/\[.*?\]/g, "")                      // tot entre claudàtors [480p] [cat-jap]
+            .replace(/\((\d{4})\)/g, "")                  // any sol entre parèntesis (1988)
+            .replace(/\([^)]*\d{4}[^)]*\)/g, "")          // parèntesis que contenen any + porqueria (1992 480p)
+            .replace(/\([^)]*(?:cat|esp|eng|jap|sub|dub|FLAC|DTS|AVC|BD|HD|by\s)[^)]*\)/gi, "")
+            .replace(/\b\d{3,4}p\b/gi, "")               // resolucions 480p 1080p
+            .replace(/\b(?:BDRemux|BluRay|WEB-?DL|WEBRip|HDRip|DVDRip|HDTV|CAM|REMUX|UHD|4K)\b/gi, "")
+            .replace(/\b(?:x264|x265|h264|h265|HEVC|AVC|AAC|FLAC|DTS|Atmos|AC3|DoVi|HDR\d*)\b/gi, "")
+            .replace(/\b(?:CAT|ESP|ENG|JAP|VAL|CAS|MAL)(?:\s*[-]\s*(?:CAT|ESP|ENG|JAP|VAL|CAS|MAL))*\b/g, "") // CAT-VAL-CAS
+            .replace(/\b(?:cat|esp|eng|jap|val|cas|mal)\b/gi, "")
+            .replace(/\bby\s+\w+/gi, "")                  // "by ackman"
+            .replace(/\bv\d+\b/gi, "")                    // versions v2
+            .replace(/\s*M\d+\s*/g, " ")                  // M07 (número de película)
+            .replace(/\bREEL\d+\b/gi, "")                 // REEL1
+            .replace(/\b\d+th\s+Anniversary\b/gi, "")     // 30th Anniversary
+            .replace(/\d+-\d+/g, "")                       // 4-3 (aspect ratio)
+            .replace(/\s+/g, " ")
+            .trim();
+
+        // 3. Extreure any si el trobem (per refinar cerca)
+        const yearMatch = name.match(/\((\d{4})\)/);
+        const year = yearMatch ? yearMatch[1] : null;
+
+        // 4. Buscar a TMDB amb fallback: títol original > títol netejat
+        const queries = [];
+        if (originalTitle) {
+            queries.push(originalTitle);
+        }
+        if (cleanedName && cleanedName.length > 1) {
+            queries.push(cleanedName);
+        }
+        if (queries.length === 0) return null;
+
+        for (const q of queries) {
+            for (const lang of ["ca", "es", "en"]) {
+                const searchUrl = `https://api.themoviedb.org/3/search/multi?api_key=${CONFIG.tmdbApiKey}&query=${encodeURIComponent(q)}&language=${lang}&page=1` + (year ? `&year=${year}` : "");
+                const response = await fetch(searchUrl);
+                if (!response.ok) continue;
+                const data = await response.json();
+                const result = data.results?.[0];
+                if (result && (result.poster_path || result.backdrop_path)) {
+                    return {
+                        poster: result.poster_path ? `https://image.tmdb.org/t/p/w500${result.poster_path}` : null,
+                        background: result.backdrop_path ? `https://image.tmdb.org/t/p/w1280${result.backdrop_path}` : null,
+                    };
+                }
+            }
+        }
+        return null;
     } catch (e) {
         return null;
     }
