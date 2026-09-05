@@ -27,7 +27,7 @@ const CONFIG = {
     considerHdrTagsAsEqual: true,
     addonName: "GDrive",
     prioritiseLanguage: null,
-    proxiedPlayback: true,
+    proxiedPlayback: false,
     strictTitleCheck: false,
     tmdbApiKey: null,
     enableSearchCatalog: true,
@@ -92,6 +92,7 @@ const API_ENDPOINTS = {
     TMDB_FIND:
         "https://api.themoviedb.org/3/find/{id}?api_key={apiKey}&external_source=imdb_id",
     TMDB_DETAILS: "https://api.themoviedb.org/3/{type}/{id}?api_key={apiKey}",
+    TMDB_SEARCH: "https://api.themoviedb.org/3/search/multi?api_key={apiKey}&query={query}&page=1",
 };
 
 const REGEX_PATTERNS = {
@@ -691,7 +692,31 @@ async function getTmdbMeta(type, id) {
     return {
         name: result.name || result.title,
         year: (result.release_date || result.first_air_date).split("-")[0],
+        poster: result.poster_path ? `https://image.tmdb.org/t/p/w500${result.poster_path}` : null,
+        background: result.backdrop_path ? `https://image.tmdb.org/t/p/w1280${result.backdrop_path}` : null,
+        logo: result.logo_path ? `https://image.tmdb.org/t/p/w300${result.logo_path}` : null,
     };
+}
+
+async function getTmdbPosterByName(name) {
+    if (!CONFIG.tmdbApiKey) return null;
+    try {
+        const cleanName = name.replace(/[\[\(].*?[\]\)]/g, "").replace(/\d{4}/, "").trim();
+        const url = API_ENDPOINTS.TMDB_SEARCH
+            .replace("{apiKey}", CONFIG.tmdbApiKey)
+            .replace("{query}", encodeURIComponent(cleanName));
+        const response = await fetch(url);
+        if (!response.ok) return null;
+        const data = await response.json();
+        const result = data.results?.[0];
+        if (!result) return null;
+        return {
+            poster: result.poster_path ? `https://image.tmdb.org/t/p/w500${result.poster_path}` : null,
+            background: result.backdrop_path ? `https://image.tmdb.org/t/p/w1280${result.backdrop_path}` : null,
+        };
+    } catch (e) {
+        return null;
+    }
 }
 
 async function getCinemetaMeta(type, id) {
@@ -1246,26 +1271,29 @@ async function handleRequest(request) {
             return createProxiedStreamResponse(fileId, filename, request);
         }
 
-        const createMetaObject = (id, name, size, thumbnail, createdTime) => ({
-            id: `gdrive:${id}`,
-            name,
-            posterShape: "landscape",
-            background: thumbnail,
-            poster: thumbnail,
-            description:
-                `Size: ${formatSize(size)}` +
-                (createdTime
-                    ? ` | Created: ${new Date(createdTime).toLocaleDateString(
-                          "en-GB",
-                          {
-                              year: "numeric",
-                              month: "long",
-                              day: "numeric",
-                          }
-                      )}`
-                    : ""),
-            type: "movie",
-        });
+        const createMetaObject = async (id, name, size, thumbnail, createdTime) => {
+            const tmdb = await getTmdbPosterByName(name);
+            return {
+                id: `gdrive:${id}`,
+                name,
+                posterShape: "poster",
+                background: tmdb?.background || thumbnail,
+                poster: tmdb?.poster || thumbnail,
+                description:
+                    `Size: ${formatSize(size)}` +
+                    (createdTime
+                        ? ` | Created: ${new Date(createdTime).toLocaleDateString(
+                              "en-GB",
+                              {
+                                  year: "numeric",
+                                  month: "long",
+                                  day: "numeric",
+                              }
+                          )}`
+                        : ""),
+                type: "movie",
+            };
+        };
 
         if (metaMatch) {
             const fullMetaId = metaMatch[2];
@@ -1347,7 +1375,7 @@ async function handleRequest(request) {
             console.log({ message: "File fetched", file });
             const parsedFile = parseFile(file);
             return createJsonResponse({
-                meta: createMetaObject(
+                meta: await createMetaObject(
                     parsedFile.id,
                     parsedFile.name,
                     parsedFile.size,
@@ -1378,14 +1406,20 @@ async function handleRequest(request) {
                         const subfolders = await listChildren(rootId, accessToken, {
                             onlyFolders: true,
                         });
-                        for (const folder of subfolders) {
-                            metas.push({
-                                id: `gdriveshow:${folder.id}`,
-                                type: "series",
-                                name: folder.name,
-                                posterShape: "poster",
-                            });
-                        }
+                        const folderMetas = await Promise.all(
+                            subfolders.map(async (folder) => {
+                                const tmdb = await getTmdbPosterByName(folder.name);
+                                return {
+                                    id: `gdriveshow:${folder.id}`,
+                                    type: "series",
+                                    name: folder.name,
+                                    posterShape: "poster",
+                                    poster: tmdb?.poster || null,
+                                    background: tmdb?.background || null,
+                                };
+                            })
+                        );
+                        metas.push(...folderMetas);
                     }
                 } catch (error) {
                     console.error({
@@ -1436,7 +1470,7 @@ async function handleRequest(request) {
                 }
 
                 const results = await fetchFiles(fetchUrl, accessToken);
-                const metas = results.files.map((file) =>
+                const metas = await Promise.all(results.files.map((file) =>
                     createMetaObject(
                         file.id,
                         file.name,
@@ -1444,7 +1478,7 @@ async function handleRequest(request) {
                         file.thumbnailLink,
                         file.createdTime
                     )
-                );
+                ));
                 console.log({
                     message: "Catalog response",
                     numMetas: metas.length,
@@ -1483,7 +1517,7 @@ async function handleRequest(request) {
                     return createJsonResponse({ metas: [] });
                 }
 
-                const metas = results.files.map((file) =>
+                const metas = await Promise.all(results.files.map((file) =>
                     createMetaObject(
                         file.id,
                         file.name,
@@ -1491,7 +1525,7 @@ async function handleRequest(request) {
                         file.thumbnailLink,
                         file.createdTime
                     )
-                );
+                ));
 
                 return createJsonResponse({ metas });
             }
