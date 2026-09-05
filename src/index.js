@@ -73,6 +73,9 @@ const MANIFEST = {
     types: ["movie", "series"],
 };
 
+// Mapping IMDB ID → GDrive folder/file per streams
+const IMDB_TO_GDRIVE = new Map(); // "tt1234567" → { type: "series"|"movie", id: "folderId/fileId" }
+
 const HEADERS = {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
@@ -92,6 +95,7 @@ const API_ENDPOINTS = {
         "https://api.themoviedb.org/3/find/{id}?api_key={apiKey}&external_source=imdb_id",
     TMDB_DETAILS: "https://api.themoviedb.org/3/{type}/{id}?api_key={apiKey}",
     TMDB_SEARCH: "https://api.themoviedb.org/3/search/multi?api_key={apiKey}&query={query}&page=1",
+    TMDB_EXTERNAL_IDS: "https://api.themoviedb.org/3/{type}/{id}/external_ids?api_key={apiKey}",
 };
 
 const REGEX_PATTERNS = {
@@ -751,9 +755,27 @@ async function getTmdbPosterByName(name) {
                 const data = await response.json();
                 const result = data.results?.[0];
                 if (result && (result.poster_path || result.backdrop_path)) {
+                    // Obtenir IMDB ID via external_ids
+                    let imdbId = null;
+                    if (result.id && CONFIG.tmdbApiKey) {
+                        try {
+                            const mediaType = result.media_type === "movie" ? "movie" : "tv";
+                            const extUrl = API_ENDPOINTS.TMDB_EXTERNAL_IDS
+                                .replace("{type}", mediaType)
+                                .replace("{id}", result.id)
+                                .replace("{apiKey}", CONFIG.tmdbApiKey);
+                            const extRes = await fetch(extUrl);
+                            if (extRes.ok) {
+                                const extData = await extRes.json();
+                                imdbId = extData.imdb_id || null;
+                            }
+                        } catch (e) { /* ignore */ }
+                    }
                     return {
                         poster: result.poster_path ? `https://image.tmdb.org/t/p/w500${result.poster_path}` : null,
                         background: result.backdrop_path ? `https://image.tmdb.org/t/p/w1280${result.backdrop_path}` : null,
+                        imdbId,
+                        tmdbType: result.media_type,
                     };
                 }
             }
@@ -1271,7 +1293,7 @@ async function handleRequest(request) {
                 });
                 manifest.resources.push({
                     name: "meta",
-                    types: ["movie", "series", "anime"],
+                    types: ["movie", "series"],
                     idPrefixes: ["gdrive:", "gdriveshow:"],
                 });
             }
@@ -1318,8 +1340,12 @@ async function handleRequest(request) {
 
         const createMetaObject = async (id, name, size, thumbnail, createdTime) => {
             const tmdb = await getTmdbPosterByName(name);
+            const useImdb = tmdb?.imdbId;
+            if (useImdb) {
+                IMDB_TO_GDRIVE.set(tmdb.imdbId, { type: "movie", id: id });
+            }
             return {
-                id: `gdrive:${id}`,
+                id: useImdb ? tmdb.imdbId : `gdrive:${id}`,
                 name,
                 posterShape: "poster",
                 background: tmdb?.background || thumbnail,
@@ -1454,6 +1480,18 @@ async function handleRequest(request) {
                         const folderMetas = await Promise.all(
                             subfolders.map(async (folder) => {
                                 const tmdb = await getTmdbPosterByName(folder.name);
+                                if (tmdb?.imdbId) {
+                                    IMDB_TO_GDRIVE.set(tmdb.imdbId, { type: "series", id: folder.id });
+                                    return {
+                                        id: tmdb.imdbId,
+                                        type: "series",
+                                        name: folder.name,
+                                        posterShape: "poster",
+                                        poster: tmdb.poster || null,
+                                        background: tmdb.background || null,
+                                    };
+                                }
+                                // Fallback sense IMDB: mantenir ID custom
                                 return {
                                     id: `gdriveshow:${folder.id}`,
                                     type: "series",
@@ -1689,6 +1727,58 @@ async function createProxiedStreamResponse(fileId, filename, request) {
 
 async function getStreams(streamRequest) {
     const streams = [];
+    const imdbId = streamRequest.id.split(":")[0];
+
+    // Comprovar si tenim un mapping directe IMDB → carpeta GDrive (collections)
+    const mapping = IMDB_TO_GDRIVE.get(imdbId);
+    if (mapping && mapping.type === "series" && streamRequest.season && streamRequest.episode) {
+        try {
+            const accessToken = await getAccessToken();
+            if (accessToken) {
+                const fitxersRuta = await walkCollectionFiles(mapping.id, accessToken);
+                const episodis = assignaEpisodis(fitxersRuta);
+                const targetSeason = parseInt(streamRequest.season, 10);
+                const targetEpisode = parseInt(streamRequest.episode, 10);
+                const matches = episodis.filter(
+                    (ep) => ep.season === targetSeason && ep.episode === targetEpisode
+                );
+                for (const match of matches) {
+                    const file = match.file;
+                    const parsedFile = parseFile(file);
+                    const stream = createStream(parsedFile, accessToken);
+                    if (stream) streams.push(stream);
+                }
+                if (streams.length > 0) {
+                    console.log({ message: "Found streams via collection mapping", imdbId, season: targetSeason, episode: targetEpisode, count: streams.length });
+                    return streams;
+                }
+            }
+        } catch (e) {
+            console.error({ message: "Error in collection stream lookup", error: e.toString() });
+        }
+    }
+
+    // Comprovar si tenim un mapping directe IMDB → fitxer GDrive (pelis)
+    if (mapping && mapping.type === "movie") {
+        try {
+            const accessToken = await getAccessToken();
+            if (accessToken) {
+                const file = await fetchFile(mapping.id, accessToken);
+                if (file) {
+                    const parsedFile = parseFile(file);
+                    const stream = createStream(parsedFile, accessToken);
+                    if (stream) {
+                        console.log({ message: "Found stream via movie mapping", imdbId, fileId: mapping.id });
+                        return [stream];
+                    }
+                }
+            }
+        } catch (e) {
+            console.error({ message: "Error in movie stream lookup", error: e.toString() });
+        }
+    }
+
+    // Fallback: cerca per títol a Google Drive (comportament original)
     const query = await buildSearchQuery(streamRequest);
     console.log({ message: "Built search query", query, config: CONFIG });
 
