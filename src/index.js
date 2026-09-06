@@ -1271,11 +1271,8 @@ function pngPortada(titol) {
     return pngIndexat(idx, W, H, paleta);
 }
 
-function posterGenerat(titol, { fileId = null, folderId = null } = {}) {
-    let u = `${globalThis.__origin || ""}/poster?t=${encodeURIComponent(titol || "?")}`;
-    if (fileId) u += `&f=${encodeURIComponent(fileId)}`;
-    if (folderId) u += `&d=${encodeURIComponent(folderId)}`;
-    return u;
+function posterGenerat(titol) {
+    return `${globalThis.__origin || ""}/poster?t=${encodeURIComponent(titol || "?")}`;
 }
 
 async function imatgesPerImdb(imdbId) {
@@ -1374,13 +1371,37 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
             const results = data.results || [];
 
             let m = null;
-            for (const r of results.slice(0, 6)) {
+            for (const r of results.slice(0, 8)) {
                 const mt = r.media_type || (endpoint === "tv" ? "tv" : "movie");
                 if (preferTv && mt === "movie") continue;
+
                 const score = puntua(r, q);
-                if (score === 0) continue;
-                if (!m || score > m.score) m = { result: { ...r, media_type: mt }, score };
-                if (score === 3) break;
+                // PUNTUACIÓ MÍNIMA 2. Amb 1 n'hi havia prou que un títol
+                // contingués l'altre o compartissin un 60% de paraules, i
+                // això colava obres sense cap relació. Pitjor encara: el
+                // match dolent es desava al mapa amb el seu IMDb ID, i això
+                // deixava la cerca d'streams apuntant a la carpeta errònia.
+                if (score < 2) continue;
+
+                // Desempats, per ordre d'importància:
+                let bonus = 0;
+                //  · l'any coincideix amb el del nom de la carpeta
+                const dataR = r.first_air_date || r.release_date || "";
+                if (year && dataR.startsWith(year)) bonus += 0.5;
+                else if (year && dataR) {
+                    const diff = Math.abs(parseInt(dataR.slice(0, 4), 10) - parseInt(year, 10));
+                    if (diff <= 1) bonus += 0.25;
+                    else if (diff > 8) bonus -= 0.3;   // molt lluny: sospitós
+                }
+                //  · animació quan busquem una sèrie. El fons és pràcticament
+                //    tot anime i dibuixos, i molts títols tenen una versió
+                //    d'imatge real amb el MATEIX nom (ex. Lucky Luke).
+                if (preferTv && Array.isArray(r.genre_ids) && r.genre_ids.includes(16)) {
+                    bonus += 0.4;
+                }
+
+                const total = score + bonus;
+                if (!m || total > m.total) m = { result: { ...r, media_type: mt }, score, total };
             }
             return m;
         }
@@ -1391,8 +1412,8 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
         for (const q of queries) {
             if (!quedaPressupost(5)) break;
             const m = await cercaTmdb(q);
-            if (m && (!millor || m.score > millor.score)) millor = m;
-            if (millor?.score === 3) break;
+            if (m && (!millor || m.total > millor.total)) millor = m;
+            if (millor && millor.score === 3 && millor.total >= 3.4) break;
         }
 
         // NIVELL 2: sense accents. "Anastàsia" → "Anastasia" casa directament
@@ -1401,7 +1422,7 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
             const sa = senseAccents(queries[0]);
             if (sa !== queries[0]) {
                 const alt = await cercaTmdb(sa);
-                if (alt && (!millor || alt.score > millor.score)) millor = alt;
+                if (alt && (!millor || alt.total > millor.total)) millor = alt;
             }
         }
 
@@ -2183,71 +2204,13 @@ async function handleRequest(request) {
         // sense cap dependència externa ni cap subpetició.
         if (url.pathname === "/poster") {
             const titol = url.searchParams.get("t") || "?";
-            const fileId = url.searchParams.get("f");
-            const folderId = url.searchParams.get("d");
+            // NOTA: abans això intentava servir la miniatura que Drive genera
+            // del vídeo. Es va descartar perquè la miniatura és sempre el
+            // primer fotograma —pantalla negra, crèdits o un pla sense
+            // context— i produïa portades pitjors que no tenir-ne cap.
+            // Ara sempre generem una fitxa amb el títol, que almenys és
+            // llegible i identifica l'obra.
 
-            // Preferim SEMPRE una imatge del contingut real: Drive genera una
-            // miniatura de cada vídeo. Per a una carpeta de sèrie agafem la
-            // del primer episodi. Aquesta petició la fa el reproductor en una
-            // invocació a part, així que té el seu propi pressupost i no
-            // penalitza la càrrega del catàleg.
-            try {
-                let idMiniatura = fileId;
-
-                if (!idMiniatura && folderId) {
-                    const token = await getAccessToken();
-                    if (token) {
-                        const fills = await listChildren(folderId, token, { onlyFiles: true });
-                        const video = fills.find((f) => VIDEO_EXT_REGEX.test(f.name));
-                        if (video) idMiniatura = video.id;
-                        else {
-                            // Els episodis poden estar dins subcarpetes de temporada
-                            const subs = await listChildren(folderId, token, { onlyFolders: true });
-                            if (subs.length && quedaPressupost(4)) {
-                                const nets = await listChildren(subs[0].id, token, { onlyFiles: true });
-                                const v2 = nets.find((f) => VIDEO_EXT_REGEX.test(f.name));
-                                if (v2) idMiniatura = v2.id;
-                            }
-                        }
-                    }
-                }
-
-                if (idMiniatura) {
-                    const token = await getAccessToken();
-                    if (token && quedaPressupost(3)) {
-                        consumeix(1);
-                        const meta = await fetch(
-                            `${API_ENDPOINTS.DRIVE_FETCH_FILE.replace("{fileId}", idMiniatura)}`
-                            + "?fields=thumbnailLink&supportsAllDrives=true",
-                            { headers: { Authorization: `Bearer ${token}` } }
-                        );
-                        if (meta.ok) {
-                            const { thumbnailLink } = await meta.json();
-                            if (thumbnailLink) {
-                                // Demanem la miniatura més gran que Drive ofereixi
-                                const gran = thumbnailLink.replace(/=s\d+$/, "=s600");
-                                consumeix(1);
-                                const img = await fetch(gran, {
-                                    headers: { Authorization: `Bearer ${token}` },
-                                });
-                                if (img.ok) {
-                                    return new Response(img.body, {
-                                        headers: {
-                                            "Content-Type": img.headers.get("Content-Type") || "image/jpeg",
-                                            "Cache-Control": "public, max-age=604800",
-                                            "Access-Control-Allow-Origin": "*",
-                                        },
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            } catch (e) {
-                console.error({ message: "Miniatura no disponible", error: e.toString() });
-            }
-
-            // Sense miniatura: caràtula generada amb el títol imprès
             return new Response(pngPortada(titol), {
                 headers: {
                     "Content-Type": "image/png",
@@ -2426,7 +2389,7 @@ ${acabat
                 name: dades?.title || name,
                 type: "movie",
                 posterShape: "poster",
-                poster: dades?.poster || posterGenerat(dades?.title || name, { fileId: id }),
+                poster: dades?.poster || posterGenerat(dades?.title || name),
                 background: dades?.background || thumbnail || null,
                 description:
                     `Mida: ${formatSize(size)}` +
@@ -2594,7 +2557,7 @@ ${acabat
                             type: "series",
                             name: dades.title || folder.name,
                             posterShape: "poster",
-                            poster: dades.poster || posterGenerat(dades.title || folder.name, { folderId: folder.id }),
+                            poster: dades.poster || posterGenerat(dades.title || folder.name),
                             background: dades.background || null,
                         });
                     } else {
@@ -2603,7 +2566,7 @@ ${acabat
                             type: "series",
                             name: folder.name,
                             posterShape: "poster",
-                            poster: dades.poster || posterGenerat(folder.name, { folderId: folder.id }),
+                            poster: dades.poster || posterGenerat(folder.name),
                             background: dades.background || null,
                         });
                     }
@@ -2615,7 +2578,7 @@ ${acabat
                         type: "series",
                         name: folder.name,
                         posterShape: "poster",
-                        poster: posterGenerat(folder.name, { folderId: folder.id }),
+                        poster: posterGenerat(folder.name),
                     });
                 }
 
@@ -2906,16 +2869,17 @@ function normalitzaTitol(t) {
 async function findCollectionFolder(imdbId, accessToken) {
     if (IMDB_TO_GDRIVE.has(imdbId)) {
         const mapping = IMDB_TO_GDRIVE.get(imdbId);
-        if (mapping.type === "series") return mapping.id;
+        if (mapping.type === "series") return [mapping.id];
     }
 
     // El mapa persistent ja té la correspondència si /omplir l'ha resolt.
-    // És una consulta en memòria, sense cap crida externa.
+    // Pot haver-hi MÉS D'UNA carpeta amb el mateix IMDb ID (per exemple una
+    // per qualitat o per temporada), així que les retornem totes i qui crida
+    // les prova una a una fins que alguna contingui l'episodi demanat.
     const delMapa = await buscaAlMapa(imdbId);
     if (delMapa?.tipus === "series" && delMapa.ids.length) {
-        IMDB_TO_GDRIVE.set(imdbId, { type: "series", id: delMapa.ids[0] });
-        console.log({ message: "Carpeta trobada al mapa", imdbId, folderId: delMapa.ids[0] });
-        return delMapa.ids[0];
+        console.log({ message: "Carpetes trobades al mapa", imdbId, carpetes: delMapa.ids });
+        return delMapa.ids;
     }
 
     const titles = await getTitolsAlternatius(imdbId, "series");
@@ -2949,10 +2913,10 @@ async function findCollectionFolder(imdbId, accessToken) {
 
     if (millor) {
         IMDB_TO_GDRIVE.set(imdbId, { type: "series", id: millor.id });
-        console.log({ message: "Collection folder trobada", imdbId, carpeta: millor.nom, score: millor.score });
-        return millor.id;
+        console.log({ message: "Carpeta trobada per títol", imdbId, carpeta: millor.nom, score: millor.score });
+        return [millor.id];
     }
-    return null;
+    return [];
 }
 
 async function findMovieFiles(imdbId, accessToken) {
@@ -3053,16 +3017,16 @@ async function getStreams(streamRequest) {
         try {
             const accessToken = await getAccessToken();
             if (accessToken) {
-                const folderId = await findCollectionFolder(imdbId, accessToken);
-                if (folderId) {
-                    const targetSeason = parseInt(streamRequest.season, 10);
-                    const targetEpisode = parseInt(streamRequest.episode, 10);
+                const carpetes = await findCollectionFolder(imdbId, accessToken);
+                const targetSeason = parseInt(streamRequest.season, 10);
+                const targetEpisode = parseInt(streamRequest.episode, 10);
+                const structure = await getSeasonStructure(imdbId);
 
-                    const [fitxersRuta, structure] = await Promise.all([
-                        walkCollectionFiles(folderId, accessToken),
-                        getSeasonStructure(imdbId),
-                    ]);
-
+                // Provem cada carpeta candidata fins que alguna contingui
+                // l'episodi. Amb una sola carpeta el comportament és el mateix.
+                for (const folderId of carpetes) {
+                    if (!quedaPressupost(6)) break;
+                    const fitxersRuta = await walkCollectionFiles(folderId, accessToken);
                     const { matches, estrategia } = trobaEpisodis(
                         fitxersRuta, targetSeason, targetEpisode, structure
                     );
@@ -3097,8 +3061,8 @@ async function getStreams(streamRequest) {
                         return streams;
                     }
                     console.log({
-                        message: "Cap episodi coincident a la col·lecció",
-                        imdbId, targetSeason, targetEpisode,
+                        message: "Cap episodi coincident en aquesta carpeta",
+                        imdbId, folderId, targetSeason, targetEpisode,
                         fitxersTotals: fitxersRuta.length,
                         teEstructura: !!structure,
                     });
