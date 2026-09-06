@@ -44,6 +44,14 @@ const CONFIG = {
     // Cada títol pot costar fins a 6 subpeticions (TMDB x3 + Viquipèdia x2).
     // Amb un pressupost de 46 en caben ~7 per invocació.
     maxResolucionsPerPeticio: 7,
+
+    // Memòria cau del recorregut de col·leccions. Desactivada mentre
+    // comprovem els filtres d'extres: així cada petició recorre el Drive de
+    // nou i el que veus a Stremio reflecteix sempre l'últim codi desplegat.
+    // Per tornar-la a activar, posa-hi true. Amb ella activada, una
+    // col·lecció gran com El Detectiu Conan no esgota el pressupost de
+    // subpeticions; sense ella, pot tornar a quedar-se a mig recórrer.
+    usaCauRecorregut: false,
     // Durada del mapa a la memòria cau (segons). 7 dies.
     mapaTtlSegons: 604800,
     driveQueryTerms: {
@@ -73,7 +81,7 @@ const CONFIG = {
 
 // Identificador de la versió del codi. Serveix per verificar via /versio
 // quina versió s'està executant realment al worker.
-const VERSIO_CODI = "2026-09-06.carpeta-exacta+filtre-extres";
+const VERSIO_CODI = "2026-09-06.sense-cau-recorregut";
 
 const MANIFEST = {
     id: "stremio.gdrive.worker.cat",
@@ -1798,12 +1806,18 @@ function esCarpetaDExtres(nom) {
 // mig camí (era el cas d'El Detectiu Conan). Desem l'arbre de fitxers ja
 // recorregut: la següent petició el llegeix amb UNA sola subpetició i, a
 // més, el llistat és complet.
+// La clau inclou la versió del codi: així, cada desplegament invalida
+// automàticament tots els recorreguts desats. Sense això, un canvi als
+// filtres d'extres trigava un dia a notar-se perquè el cau servia l'arbre
+// antic, amb els extres inclosos.
 function clauCauRecorregut(folderId) {
-    return `https://gdrive-addon.local/__walk_v1/${folderId}`;
+    const v = VERSIO_CODI.replace(/[^a-zA-Z0-9._-]/g, "_");
+    return `https://gdrive-addon.local/__walk/${v}/${folderId}`;
 }
 
 async function llegeixRecorregutDelCau(folderId) {
     try {
+        if (!CONFIG.usaCauRecorregut) return null;
         if (typeof caches === "undefined" || !consumeix(1)) return null;
         const r = await caches.default.match(new Request(clauCauRecorregut(folderId)));
         if (!r) return null;
@@ -1817,6 +1831,7 @@ async function llegeixRecorregutDelCau(folderId) {
 
 async function desaRecorregutAlCau(folderId, fitxers) {
     try {
+        if (!CONFIG.usaCauRecorregut) return;
         if (typeof caches === "undefined") return;
         const r = new Response(JSON.stringify(fitxers), {
             headers: {
@@ -2366,6 +2381,7 @@ async function handleRequest(request) {
                     reintentTitolsFallits: typeof calReintentar === "function",
                 },
                 mapa: { entrades: total, ambImdbId: ambImdb, sensResoldre: total - ambImdb },
+                cauRecorregut: CONFIG.usaCauRecorregut ? "actiu" : "desactivat (proves)",
             });
         }
 
