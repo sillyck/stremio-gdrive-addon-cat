@@ -81,7 +81,7 @@ const CONFIG = {
 
 // Identificador de la versió del codi. Serveix per verificar via /versio
 // quina versió s'està executant realment al worker.
-const VERSIO_CODI = "2026-09-06.franquicies+extres-v2";
+const VERSIO_CODI = "2026-09-06.multicarpeta";
 
 const MANIFEST = {
     id: "stremio.gdrive.worker.cat",
@@ -2783,7 +2783,7 @@ ${acabat
                 const resoltesIds = new Set(jaResoltes.map((x) => x.folder.id));
                 for (const { folder, dades } of jaResoltes) {
                     if (dades.imdbId) {
-                        IMDB_TO_GDRIVE.set(dades.imdbId, { type: "series", id: folder.id });
+                        IMDB_TO_GDRIVE.set(dades.imdbId, { type: "series", ids: [folder.id] });
                         metas.push({
                             id: dades.imdbId,
                             type: "series",
@@ -3107,7 +3107,10 @@ function normalitzaTitol(t) {
 async function findCollectionFolder(imdbId, accessToken) {
     if (IMDB_TO_GDRIVE.has(imdbId)) {
         const mapping = IMDB_TO_GDRIVE.get(imdbId);
-        if (mapping.type === "series") return [mapping.id];
+        // Guardem la llista SENCERA. Abans es desava una sola carpeta i,
+        // en reutilitzar-se l'instància, les peticions següents només en
+        // provaven una: episodis presents a l'altra quedaven inabastables.
+        if (mapping.type === "series") return mapping.ids;
     }
 
     // El mapa persistent ja té la correspondència si /omplir l'ha resolt.
@@ -3162,7 +3165,7 @@ async function findCollectionFolder(imdbId, accessToken) {
     // mateixos episodis.
     const exactes = llista.filter((c) => c.score === 3);
     if (exactes.length) {
-        IMDB_TO_GDRIVE.set(imdbId, { type: "series", id: exactes[0].id });
+        IMDB_TO_GDRIVE.set(imdbId, { type: "series", ids: exactes.map((c) => c.id) });
         console.log({ message: "Carpeta trobada (exacta)", imdbId, carpeta: exactes[0].nom });
         return exactes.map((c) => c.id);
     }
@@ -3173,7 +3176,7 @@ async function findCollectionFolder(imdbId, accessToken) {
     const millorPunt = Math.max(...llista.map((c) => c.score));
     const millors = llista.filter((c) => c.score === millorPunt);
     if (millors.length === 1) {
-        IMDB_TO_GDRIVE.set(imdbId, { type: "series", id: millors[0].id });
+        IMDB_TO_GDRIVE.set(imdbId, { type: "series", ids: [millors[0].id] });
         console.log({ message: "Carpeta trobada (parcial)", imdbId, carpeta: millors[0].nom, score: millorPunt });
         return [millors[0].id];
     }
@@ -3292,59 +3295,79 @@ async function getStreams(streamRequest) {
                 // Provem cada carpeta candidata fins que alguna contingui
                 // l'episodi. Amb una sola carpeta el comportament és el mateix.
                 const titolsSerie = await getTitolsAlternatius(imdbId, "series");
+
+                // Recorrem TOTES les carpetes candidates i ajuntem el que
+                // trobem. Abans ens aturàvem a la primera que donés resultats:
+                // les versions de la segona carpeta no sortien mai, i si un
+                // episodi només hi era a la segona, es donava per inexistent.
+                const trobats = [];      // { parsed, titol }
+                const estrategies = [];
+                let fitxersRevisats = 0;
+
                 for (const folderIdBrut of carpetes) {
-                    if (!quedaPressupost(6)) break;
+                    if (!quedaPressupost(6)) {
+                        console.log({ message: "Sense pressupost per revisar la resta de carpetes", imdbId });
+                        break;
+                    }
                     const folderId = await afinaCarpetaDeSerie(folderIdBrut, titolsSerie, accessToken);
                     const fitxersRuta = await walkCollectionFiles(folderId, accessToken);
+                    fitxersRevisats += fitxersRuta.length;
+
                     const { matches, estrategia } = trobaEpisodis(
                         fitxersRuta, targetSeason, targetEpisode, structure
                     );
+                    if (!matches.length) continue;
 
-                    if (matches.length > 0) {
-                        // Cada fitxer coincident és una OPCIÓ DE QUALITAT del
-                        // mateix episodi, no un episodi diferent.
-                        const titolPerId = new Map();
-                        const parsedFiles = matches.map((m) => {
-                            const pf = parseFile(m.file);
-                            titolPerId.set(pf.id, titolEpisodiDeNom(m.nomArxiu, titolsSerie));
-                            return pf;
+                    estrategies.push(`${estrategia}(${matches.length})`);
+                    for (const m of matches) {
+                        trobats.push({
+                            parsed: parseFile(m.file),
+                            titol: titolEpisodiDeNom(m.nomArxiu, titolsSerie),
                         });
-                        // Ordena les opcions per resolució/qualitat/idioma
-                        sortParsedFiles(parsedFiles);
-
-                        for (const pf of parsedFiles) {
-                            const titol = titolPerId.get(pf.id);
-                            const stream = createStream(pf, accessToken, {
-                                season: targetSeason,
-                                episode: targetEpisode,
-                                title: titol,
-                            });
-                            if (stream) streams.push(stream);
-                        }
-                        console.log({
-                            message: "Streams trobats (col·lecció)",
-                            imdbId, targetSeason, targetEpisode,
-                            estrategia, count: streams.length,
-                        });
-                        // Un episodi hauria de tenir poques versions. Si en
-                        // surten moltes, la numeració no és fiable: registrem
-                        // les rutes per veure d'on surten.
-                        if (matches.length > 4) {
-                            console.log({
-                                message: "ATENCIÓ: massa resultats per un sol episodi",
-                                imdbId, targetSeason, targetEpisode, quants: matches.length,
-                                rutes: matches.slice(0, 15).map((m) => m.ruta.join("/")),
-                            });
-                        }
-                        return streams;
                     }
-                    console.log({
-                        message: "Cap episodi coincident en aquesta carpeta",
-                        imdbId, folderId, targetSeason, targetEpisode,
-                        fitxersTotals: fitxersRuta.length,
-                        teEstructura: !!structure,
-                    });
                 }
+
+                if (trobats.length > 0) {
+                    // Una mateixa versió pot aparèixer a dues carpetes
+                    const perId = new Map();
+                    for (const t of trobats) if (!perId.has(t.parsed.id)) perId.set(t.parsed.id, t);
+                    const unics = [...perId.values()];
+
+                    const titolPerId = new Map(unics.map((t) => [t.parsed.id, t.titol]));
+                    const parsedFiles = unics.map((t) => t.parsed);
+                    sortParsedFiles(parsedFiles);
+
+                    for (const pf of parsedFiles) {
+                        const stream = createStream(pf, accessToken, {
+                            season: targetSeason,
+                            episode: targetEpisode,
+                            title: titolPerId.get(pf.id),
+                        });
+                        if (stream) streams.push(stream);
+                    }
+
+                    console.log({
+                        message: "Streams trobats (col·lecció)",
+                        imdbId, targetSeason, targetEpisode,
+                        carpetes: carpetes.length,
+                        estrategies, count: streams.length,
+                    });
+                    if (unics.length > 4) {
+                        console.log({
+                            message: "ATENCIÓ: massa resultats per un sol episodi",
+                            imdbId, targetSeason, targetEpisode, quants: unics.length,
+                            noms: unics.slice(0, 15).map((t) => t.parsed.name),
+                        });
+                    }
+                    return streams;
+                }
+
+                console.log({
+                    message: "Cap episodi coincident a cap carpeta",
+                    imdbId, targetSeason, targetEpisode,
+                    carpetes: carpetes.length, fitxersRevisats,
+                    teEstructura: !!structure,
+                });
             }
         } catch (e) {
             console.error({ message: "Error cercant streams de sèrie", error: e.toString() });

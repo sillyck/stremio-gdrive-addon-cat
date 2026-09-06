@@ -7,7 +7,7 @@
     "dev": "wrangler dev",
     "start": "wrangler dev",
     "lint": "eslint src/index.js",
-    "test": "node test/episodis.test.js",
+    "test": "node test/episodis.test.js && node test/multicarpeta.test.js",
     "verify": "npm run lint && npm run test"
   },
   "devDependencies": {
