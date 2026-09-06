@@ -75,6 +75,22 @@ const MANIFEST = {
 
 // Mapping IMDB ID → GDrive folder/file per streams
 const IMDB_TO_GDRIVE = new Map(); // "tt1234567" → { type: "series"|"movie", id: "folderId/fileId" }
+// Cache TMDB per evitar crides repetides i rate limiting
+const TMDB_CACHE = new Map(); // "nom_netejat" → { poster, background, imdbId, tmdbType }
+
+// Limitar concurrència per no superar rate limits de TMDB (~40 req/10s)
+async function processInBatches(items, fn, batchSize = 5, delayMs = 250) {
+    const results = [];
+    for (let i = 0; i < items.length; i += batchSize) {
+        const batch = items.slice(i, i + batchSize);
+        const batchResults = await Promise.all(batch.map(fn));
+        results.push(...batchResults);
+        if (i + batchSize < items.length) {
+            await new Promise(r => setTimeout(r, delayMs));
+        }
+    }
+    return results;
+}
 
 const HEADERS = {
     "Content-Type": "application/json",
@@ -701,85 +717,150 @@ async function getTmdbMeta(type, id) {
     };
 }
 
+function cleanTitleForSearch(name) {
+    const originalTitleMatch = name.match(/\(([A-Z][A-Za-z][\w\s:!?'&\-,.]{2,})\)/);
+    const originalTitle = originalTitleMatch && 
+        !/(?:FLAC|DTS|cat|esp|eng|jap|val|cas|mal|sub|dub|BD|HD|AVC)/i.test(originalTitleMatch[1])
+        ? originalTitleMatch[1].trim() : null;
+    
+    let cleanedName = name
+        .replace(/\.[a-z0-9]{3,4}$/i, "")
+        .replace(/\[.*?\]/g, "")
+        .replace(/\((\d{4})\)/g, "")
+        .replace(/\([^)]*\d{4}[^)]*\)/g, "")
+        .replace(/\([^)]*(?:cat|esp|eng|jap|sub|dub|FLAC|DTS|AVC|BD|HD|by\s)[^)]*\)/gi, "")
+        .replace(/\b\d{3,4}p\b/gi, "")
+        .replace(/\b(?:BDRemux|BluRay|WEB-?DL|WEBRip|HDRip|DVDRip|HDTV|CAM|REMUX|UHD|4K)\b/gi, "")
+        .replace(/\b(?:x264|x265|h264|h265|HEVC|AVC|AAC|FLAC|DTS|Atmos|AC3|DoVi|HDR\d*)\b/gi, "")
+        .replace(/\b(?:CAT|ESP|ENG|JAP|VAL|CAS|MAL)(?:\s*[-]\s*(?:CAT|ESP|ENG|JAP|VAL|CAS|MAL))*\b/g, "")
+        .replace(/\b(?:cat|esp|eng|jap|val|cas|mal)\b/gi, "")
+        .replace(/\bby\s+\w+/gi, "")
+        .replace(/\bv\d+\b/gi, "")
+        .replace(/\s*M\d+\s*/g, " ")
+        .replace(/\bREEL\d+\b/gi, "")
+        .replace(/\b\d+th\s+Anniversary\b/gi, "")
+        .replace(/\d+-\d+/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    const yearMatch = name.match(/\((\d{4})\)/);
+    const year = yearMatch ? yearMatch[1] : null;
+
+    const queries = [];
+    if (originalTitle) queries.push(originalTitle);
+    if (cleanedName && cleanedName.length > 1) queries.push(cleanedName);
+
+    return { queries, year };
+}
+
 async function getTmdbPosterByName(name) {
     if (!CONFIG.tmdbApiKey) return null;
+
+    // Comprovar cache
+    const cacheKey = name.toLowerCase().trim();
+    if (TMDB_CACHE.has(cacheKey)) return TMDB_CACHE.get(cacheKey);
+
     try {
-        // 1. Extreure títol original entre parèntesis si existeix i sembla un títol real
-        //    Ex: "Blau (Ai Yori Aoshi) (2002) [cat-jap]" → "Ai Yori Aoshi"
-        const originalTitleMatch = name.match(/\(([A-Z][A-Za-z][\w\s:!?'&\-,.]{2,})\)/);
-        // Descartar si sembla tècnic (conté FLAC, DTS, cat, etc.)
-        const originalTitle = originalTitleMatch && 
-            !/(?:FLAC|DTS|cat|esp|eng|jap|val|cas|mal|sub|dub|BD|HD|AVC)/i.test(originalTitleMatch[1])
-            ? originalTitleMatch[1].trim() : null;
-        
-        // 2. Netejar nom: treure claudàtors, parèntesis amb any/codecs, extensions
-        let cleanedName = name
-            .replace(/\.[a-z0-9]{3,4}$/i, "")           // extensió (.mkv, .mp4, .avi)
-            .replace(/\[.*?\]/g, "")                      // tot entre claudàtors [480p] [cat-jap]
-            .replace(/\((\d{4})\)/g, "")                  // any sol entre parèntesis (1988)
-            .replace(/\([^)]*\d{4}[^)]*\)/g, "")          // parèntesis que contenen any + porqueria (1992 480p)
-            .replace(/\([^)]*(?:cat|esp|eng|jap|sub|dub|FLAC|DTS|AVC|BD|HD|by\s)[^)]*\)/gi, "")
-            .replace(/\b\d{3,4}p\b/gi, "")               // resolucions 480p 1080p
-            .replace(/\b(?:BDRemux|BluRay|WEB-?DL|WEBRip|HDRip|DVDRip|HDTV|CAM|REMUX|UHD|4K)\b/gi, "")
-            .replace(/\b(?:x264|x265|h264|h265|HEVC|AVC|AAC|FLAC|DTS|Atmos|AC3|DoVi|HDR\d*)\b/gi, "")
-            .replace(/\b(?:CAT|ESP|ENG|JAP|VAL|CAS|MAL)(?:\s*[-]\s*(?:CAT|ESP|ENG|JAP|VAL|CAS|MAL))*\b/g, "") // CAT-VAL-CAS
-            .replace(/\b(?:cat|esp|eng|jap|val|cas|mal)\b/gi, "")
-            .replace(/\bby\s+\w+/gi, "")                  // "by ackman"
-            .replace(/\bv\d+\b/gi, "")                    // versions v2
-            .replace(/\s*M\d+\s*/g, " ")                  // M07 (número de película)
-            .replace(/\bREEL\d+\b/gi, "")                 // REEL1
-            .replace(/\b\d+th\s+Anniversary\b/gi, "")     // 30th Anniversary
-            .replace(/\d+-\d+/g, "")                       // 4-3 (aspect ratio)
-            .replace(/\s+/g, " ")
-            .trim();
-
-        // 3. Extreure any si el trobem (per refinar cerca)
-        const yearMatch = name.match(/\((\d{4})\)/);
-        const year = yearMatch ? yearMatch[1] : null;
-
-        // 4. Buscar a TMDB amb fallback: títol original > títol netejat
-        const queries = [];
-        if (originalTitle) {
-            queries.push(originalTitle);
-        }
-        if (cleanedName && cleanedName.length > 1) {
-            queries.push(cleanedName);
-        }
+        const { queries, year } = cleanTitleForSearch(name);
         if (queries.length === 0) return null;
 
         for (const q of queries) {
-            for (const lang of ["ca", "es", "en"]) {
-                const searchUrl = `https://api.themoviedb.org/3/search/multi?api_key=${CONFIG.tmdbApiKey}&query=${encodeURIComponent(q)}&language=${lang}&page=1` + (year ? `&year=${year}` : "");
+            // Buscar primer sense idioma (resultats globals), després ca, es
+            for (const lang of ["", "ca", "es", "en"]) {
+                const langParam = lang ? `&language=${lang}` : "";
+                const searchUrl = `https://api.themoviedb.org/3/search/multi?api_key=${CONFIG.tmdbApiKey}&query=${encodeURIComponent(q)}${langParam}&page=1` + (year ? `&year=${year}` : "");
                 const response = await fetch(searchUrl);
+
+                // Rate limit: esperar i reintentar
+                if (response.status === 429) {
+                    await new Promise(r => setTimeout(r, 1500));
+                    continue;
+                }
                 if (!response.ok) continue;
+
                 const data = await response.json();
                 const result = data.results?.[0];
-                if (result && (result.poster_path || result.backdrop_path)) {
-                    // Obtenir IMDB ID via external_ids
-                    let imdbId = null;
-                    if (result.id && CONFIG.tmdbApiKey) {
-                        try {
-                            const mediaType = result.media_type === "movie" ? "movie" : "tv";
-                            const extUrl = API_ENDPOINTS.TMDB_EXTERNAL_IDS
-                                .replace("{type}", mediaType)
-                                .replace("{id}", result.id)
-                                .replace("{apiKey}", CONFIG.tmdbApiKey);
-                            const extRes = await fetch(extUrl);
-                            if (extRes.ok) {
-                                const extData = await extRes.json();
-                                imdbId = extData.imdb_id || null;
-                            }
-                        } catch (e) { /* ignore */ }
+                if (!result) continue;
+
+                // Obtenir IMDB ID via external_ids
+                let imdbId = null;
+                const mediaType = result.media_type === "movie" ? "movie" : "tv";
+                try {
+                    const extUrl = API_ENDPOINTS.TMDB_EXTERNAL_IDS
+                        .replace("{type}", mediaType)
+                        .replace("{id}", result.id)
+                        .replace("{apiKey}", CONFIG.tmdbApiKey);
+                    const extRes = await fetch(extUrl);
+                    if (extRes.ok) {
+                        const extData = await extRes.json();
+                        imdbId = extData.imdb_id || null;
                     }
-                    return {
-                        poster: result.poster_path ? `https://image.tmdb.org/t/p/w500${result.poster_path}` : null,
+                } catch (e) { /* ignore */ }
+
+                if (imdbId) {
+                    // Posters via btttr.cc (sense rate limit) + fallback TMDB
+                    const out = {
+                        poster: `https://btttr.cc/poster-n/imdb/poster-default/${imdbId}.jpg`,
                         background: result.backdrop_path ? `https://image.tmdb.org/t/p/w1280${result.backdrop_path}` : null,
                         imdbId,
                         tmdbType: result.media_type,
                     };
+                    TMDB_CACHE.set(cacheKey, out);
+                    return out;
+                }
+
+                // Sense IMDB ID: encara podem retornar poster TMDB
+                if (result.poster_path || result.backdrop_path) {
+                    const out = {
+                        poster: result.poster_path ? `https://image.tmdb.org/t/p/w500${result.poster_path}` : null,
+                        background: result.backdrop_path ? `https://image.tmdb.org/t/p/w1280${result.backdrop_path}` : null,
+                        imdbId: null,
+                        tmdbType: result.media_type,
+                    };
+                    TMDB_CACHE.set(cacheKey, out);
+                    return out;
                 }
             }
         }
+
+        // Si hem fallat amb any, reintentar sense any
+        if (year && queries.length > 0) {
+            for (const q of queries) {
+                const searchUrl = `https://api.themoviedb.org/3/search/multi?api_key=${CONFIG.tmdbApiKey}&query=${encodeURIComponent(q)}&page=1`;
+                const response = await fetch(searchUrl);
+                if (!response.ok) continue;
+                const data = await response.json();
+                const result = data.results?.[0];
+                if (!result) continue;
+
+                let imdbId = null;
+                const mediaType = result.media_type === "movie" ? "movie" : "tv";
+                try {
+                    const extUrl = API_ENDPOINTS.TMDB_EXTERNAL_IDS
+                        .replace("{type}", mediaType)
+                        .replace("{id}", result.id)
+                        .replace("{apiKey}", CONFIG.tmdbApiKey);
+                    const extRes = await fetch(extUrl);
+                    if (extRes.ok) {
+                        const extData = await extRes.json();
+                        imdbId = extData.imdb_id || null;
+                    }
+                } catch (e) { /* ignore */ }
+
+                const out = {
+                    poster: imdbId
+                        ? `https://btttr.cc/poster-n/imdb/poster-default/${imdbId}.jpg`
+                        : (result.poster_path ? `https://image.tmdb.org/t/p/w500${result.poster_path}` : null),
+                    background: result.backdrop_path ? `https://image.tmdb.org/t/p/w1280${result.backdrop_path}` : null,
+                    imdbId,
+                    tmdbType: result.media_type,
+                };
+                TMDB_CACHE.set(cacheKey, out);
+                return out;
+            }
+        }
+
+        TMDB_CACHE.set(cacheKey, null);
         return null;
     } catch (e) {
         return null;
