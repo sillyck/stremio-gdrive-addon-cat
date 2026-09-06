@@ -185,6 +185,13 @@ async function buscaAlMapa(imdbId) {
     return INDEX_INVERS.get(imdbId) || null;
 }
 
+// Una entrada sense IMDb ID es reintenta fins a 3 vegades: el reconeixement
+// millora amb el temps i no volem que un fracàs antic quedi congelat.
+function calReintentar(entrada) {
+    if (entrada?.imdbId) return false;
+    return (entrada?.intents || 0) < 3;
+}
+
 function llegeixMapa(clau) {
     return MAPA?.[clau] || null;
 }
@@ -1087,33 +1094,62 @@ function hslARgb(h, s, l) {
     ];
 }
 
-function pngDegradat(titol) {
-    // Mida petita: Stremio recomana caràtules per sota de 100 kB i l'escala
-    // ell mateix. 60×90 manté la proporció 1:0.675 i pesa molt poc.
-    const W = 60, H = 90;
-    const to = [...titol].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7) % 360;
-    const dalt = hslARgb(to, 45, 34);
-    const baix = hslARgb((to + 40) % 360, 50, 15);
+// Font de 5x7 píxels: cada glif són 5 columnes i cada columna 7 bits
+// (bit 0 = fila superior). Permet imprimir el títol dins la caràtula sense
+// cap dependència ni font externa.
+const FONT_5X7 = {
+    "A":[0x7C,0x12,0x11,0x12,0x7C],"B":[0x7F,0x49,0x49,0x49,0x36],
+    "C":[0x3E,0x41,0x41,0x41,0x22],"D":[0x7F,0x41,0x41,0x22,0x1C],
+    "E":[0x7F,0x49,0x49,0x49,0x41],"F":[0x7F,0x09,0x09,0x09,0x01],
+    "G":[0x3E,0x41,0x49,0x49,0x7A],"H":[0x7F,0x08,0x08,0x08,0x7F],
+    "I":[0x00,0x41,0x7F,0x41,0x00],"J":[0x20,0x40,0x41,0x3F,0x01],
+    "K":[0x7F,0x08,0x14,0x22,0x41],"L":[0x7F,0x40,0x40,0x40,0x40],
+    "M":[0x7F,0x02,0x0C,0x02,0x7F],"N":[0x7F,0x04,0x08,0x10,0x7F],
+    "O":[0x3E,0x41,0x41,0x41,0x3E],"P":[0x7F,0x09,0x09,0x09,0x06],
+    "Q":[0x3E,0x41,0x51,0x21,0x5E],"R":[0x7F,0x09,0x19,0x29,0x46],
+    "S":[0x46,0x49,0x49,0x49,0x31],"T":[0x01,0x01,0x7F,0x01,0x01],
+    "U":[0x3F,0x40,0x40,0x40,0x3F],"V":[0x1F,0x20,0x40,0x20,0x1F],
+    "W":[0x7F,0x20,0x18,0x20,0x7F],"X":[0x63,0x14,0x08,0x14,0x63],
+    "Y":[0x03,0x04,0x78,0x04,0x03],"Z":[0x61,0x51,0x49,0x45,0x43],
+    "0":[0x3E,0x51,0x49,0x45,0x3E],"1":[0x00,0x42,0x7F,0x40,0x00],
+    "2":[0x42,0x61,0x51,0x49,0x46],"3":[0x21,0x41,0x45,0x4B,0x31],
+    "4":[0x18,0x14,0x12,0x7F,0x10],"5":[0x27,0x45,0x45,0x45,0x39],
+    "6":[0x3C,0x4A,0x49,0x49,0x30],"7":[0x01,0x71,0x09,0x05,0x03],
+    "8":[0x36,0x49,0x49,0x49,0x36],"9":[0x06,0x49,0x49,0x29,0x1E],
+    " ":[0,0,0,0,0],"-":[0x08,0x08,0x08,0x08,0x08],
+    "'":[0x00,0x05,0x03,0x00,0x00],".":[0x00,0x60,0x60,0x00,0x00],
+    "&":[0x36,0x49,0x55,0x22,0x50],":":[0x00,0x36,0x36,0x00,0x00],
+    "!":[0x00,0x00,0x5F,0x00,0x00],"?":[0x02,0x01,0x51,0x09,0x06],
+};
 
-    // Píxels en cru: cada fila comença amb el byte de filtre (0 = cap)
-    const cru = new Uint8Array(H * (1 + W * 3));
+function aFont(txt) {
+    return (txt || "")
+        .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+        .toUpperCase()
+        .split("")
+        .filter((c) => FONT_5X7[c])
+        .join("");
+}
+
+// Empaqueta una imatge indexada de 2 bits (4 colors) en un PNG vàlid.
+// Amb paleta ocupa 12 vegades menys que en RGB: una caràtula de 240x360
+// queda per sota dels 25 kB, molt dins del que recomana Stremio (<100 kB).
+function pngIndexat(idx, W, H, paleta) {
+    const perFila = Math.ceil(W / 4);           // 4 píxels per byte a 2 bits
+    const cru = new Uint8Array(H * (1 + perFila));
     let p = 0;
     for (let y = 0; y < H; y++) {
-        cru[p++] = 0;
-        const t = y / (H - 1);
-        const r = Math.round(dalt[0] + (baix[0] - dalt[0]) * t);
-        const g = Math.round(dalt[1] + (baix[1] - dalt[1]) * t);
-        const b = Math.round(dalt[2] + (baix[2] - dalt[2]) * t);
-        for (let x = 0; x < W; x++) {
-            // Marc clar per donar-hi aspecte de caràtula
-            const vora = x < 2 || x >= W - 2 || y < 2 || y >= H - 2;
-            cru[p++] = vora ? Math.min(255, r + 40) : r;
-            cru[p++] = vora ? Math.min(255, g + 40) : g;
-            cru[p++] = vora ? Math.min(255, b + 40) : b;
+        cru[p++] = 0;                            // filtre "cap"
+        for (let x = 0; x < W; x += 4) {
+            let b = 0;
+            for (let k = 0; k < 4; k++) {
+                const v = x + k < W ? idx[y * W + x + k] & 3 : 0;
+                b |= v << (6 - k * 2);
+            }
+            cru[p++] = b;
         }
     }
 
-    // zlib amb blocs "stored": 2 bytes de capçalera + blocs + adler32
     const MAX = 65535;
     const nBlocs = Math.ceil(cru.length / MAX);
     const zlib = new Uint8Array(2 + nBlocs * 5 + cru.length + 4);
@@ -1121,8 +1157,7 @@ function pngDegradat(titol) {
     zlib[q++] = 0x78; zlib[q++] = 0x01;
     for (let i = 0; i < cru.length; i += MAX) {
         const tros = cru.subarray(i, Math.min(i + MAX, cru.length));
-        const ultim = i + MAX >= cru.length ? 1 : 0;
-        zlib[q++] = ultim;
+        zlib[q++] = i + MAX >= cru.length ? 1 : 0;
         zlib[q++] = tros.length & 255;
         zlib[q++] = (tros.length >>> 8) & 255;
         zlib[q++] = ~tros.length & 255;
@@ -1132,13 +1167,21 @@ function pngDegradat(titol) {
     zlib.set(u32(adler32(cru)), q); q += 4;
 
     const ihdr = new Uint8Array(13);
-    ihdr.set(u32(W), 0);
-    ihdr.set(u32(H), 4);
-    ihdr[8] = 8;    // 8 bits per canal
-    ihdr[9] = 2;    // color RGB
+    ihdr.set(u32(W), 0); ihdr.set(u32(H), 4);
+    ihdr[8] = 2;    // 2 bits per píxel
+    ihdr[9] = 3;    // color indexat (paleta)
+
+    const plte = new Uint8Array(12);
+    for (let i = 0; i < 4; i++) {
+        plte[i * 3] = paleta[i][0];
+        plte[i * 3 + 1] = paleta[i][1];
+        plte[i * 3 + 2] = paleta[i][2];
+    }
+
     const parts = [
         new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]),
         troç("IHDR", ihdr),
+        troç("PLTE", plte),
         troç("IDAT", zlib.subarray(0, q)),
         troç("IEND", new Uint8Array(0)),
     ];
@@ -1149,8 +1192,86 @@ function pngDegradat(titol) {
     return png;
 }
 
-function posterGenerat(titol) {
-    return `${globalThis.__origin || ""}/poster?t=${encodeURIComponent(titol || "?")}`;
+// Caràtula generada amb el títol imprès. Colors derivats del títol, així que
+// cada obra té sempre la mateixa i es distingeixen entre elles d'un cop d'ull.
+function pngPortada(titol) {
+    const W = 240, H = 360;
+    const to = [...(titol || "?")].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7) % 360;
+    const paleta = [
+        hslARgb(to, 38, 16),            // 0 fons
+        hslARgb(to, 45, 26),            // 1 banda superior
+        hslARgb((to + 25) % 360, 55, 45), // 2 marc
+        [245, 245, 245],                 // 3 text
+    ];
+
+    const idx = new Uint8Array(W * H);
+    for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+            const vora = x < 4 || x >= W - 4 || y < 4 || y >= H - 4;
+            idx[y * W + x] = vora ? 2 : (y < H * 0.28 ? 1 : 0);
+        }
+    }
+
+    const ESCALA = 3;
+    const AMPLE_CAR = 6 * ESCALA;
+    const MAX_CARS = Math.floor((W - 24) / AMPLE_CAR);
+
+    // Partim per paraules, però una paraula més llarga que la línia s'ha de
+    // tallar igualment: si no, es perd pels costats de la caràtula.
+    const mots = [];
+    for (const mot of aFont(titol).split(" ")) {
+        if (!mot) continue;
+        if (mot.length <= MAX_CARS) { mots.push(mot); continue; }
+        for (let i = 0; i < mot.length; i += MAX_CARS) {
+            mots.push(mot.slice(i, i + MAX_CARS));
+        }
+    }
+
+    const linies = [];
+    let actual = "";
+    for (const mot of mots) {
+        if ((actual + " " + mot).trim().length > MAX_CARS && actual) {
+            linies.push(actual.trim());
+            actual = mot;
+        } else {
+            actual = (actual + " " + mot).trim();
+        }
+    }
+    if (actual) linies.push(actual);
+    const visibles = linies.slice(0, 9);
+
+    const ALT_LIN = 7 * ESCALA + 10;
+    let y0 = Math.round((H - visibles.length * ALT_LIN) / 2);
+
+    for (const lin of visibles) {
+        let x0 = Math.round((W - (lin.length * AMPLE_CAR - ESCALA)) / 2);
+        for (const ch of lin) {
+            const glif = FONT_5X7[ch] || FONT_5X7[" "];
+            for (let c = 0; c < 5; c++) {
+                for (let f = 0; f < 7; f++) {
+                    if (!((glif[c] >> f) & 1)) continue;
+                    for (let dy = 0; dy < ESCALA; dy++) {
+                        for (let dx = 0; dx < ESCALA; dx++) {
+                            const x = x0 + c * ESCALA + dx;
+                            const y = y0 + f * ESCALA + dy;
+                            if (x >= 0 && x < W && y >= 0 && y < H) idx[y * W + x] = 3;
+                        }
+                    }
+                }
+            }
+            x0 += AMPLE_CAR;
+        }
+        y0 += ALT_LIN;
+    }
+
+    return pngIndexat(idx, W, H, paleta);
+}
+
+function posterGenerat(titol, { fileId = null, folderId = null } = {}) {
+    let u = `${globalThis.__origin || ""}/poster?t=${encodeURIComponent(titol || "?")}`;
+    if (fileId) u += `&f=${encodeURIComponent(fileId)}`;
+    if (folderId) u += `&d=${encodeURIComponent(folderId)}`;
+    return u;
 }
 
 async function imatgesPerImdb(imdbId) {
@@ -2119,10 +2240,75 @@ async function handleRequest(request) {
         // sense cap dependència externa ni cap subpetició.
         if (url.pathname === "/poster") {
             const titol = url.searchParams.get("t") || "?";
-            return new Response(pngDegradat(titol), {
+            const fileId = url.searchParams.get("f");
+            const folderId = url.searchParams.get("d");
+
+            // Preferim SEMPRE una imatge del contingut real: Drive genera una
+            // miniatura de cada vídeo. Per a una carpeta de sèrie agafem la
+            // del primer episodi. Aquesta petició la fa el reproductor en una
+            // invocació a part, així que té el seu propi pressupost i no
+            // penalitza la càrrega del catàleg.
+            try {
+                let idMiniatura = fileId;
+
+                if (!idMiniatura && folderId) {
+                    const token = await getAccessToken();
+                    if (token) {
+                        const fills = await listChildren(folderId, token, { onlyFiles: true });
+                        const video = fills.find((f) => VIDEO_EXT_REGEX.test(f.name));
+                        if (video) idMiniatura = video.id;
+                        else {
+                            // Els episodis poden estar dins subcarpetes de temporada
+                            const subs = await listChildren(folderId, token, { onlyFolders: true });
+                            if (subs.length && quedaPressupost(4)) {
+                                const nets = await listChildren(subs[0].id, token, { onlyFiles: true });
+                                const v2 = nets.find((f) => VIDEO_EXT_REGEX.test(f.name));
+                                if (v2) idMiniatura = v2.id;
+                            }
+                        }
+                    }
+                }
+
+                if (idMiniatura) {
+                    const token = await getAccessToken();
+                    if (token && quedaPressupost(3)) {
+                        consumeix(1);
+                        const meta = await fetch(
+                            `${API_ENDPOINTS.DRIVE_FETCH_FILE.replace("{fileId}", idMiniatura)}`
+                            + "?fields=thumbnailLink&supportsAllDrives=true",
+                            { headers: { Authorization: `Bearer ${token}` } }
+                        );
+                        if (meta.ok) {
+                            const { thumbnailLink } = await meta.json();
+                            if (thumbnailLink) {
+                                // Demanem la miniatura més gran que Drive ofereixi
+                                const gran = thumbnailLink.replace(/=s\d+$/, "=s600");
+                                consumeix(1);
+                                const img = await fetch(gran, {
+                                    headers: { Authorization: `Bearer ${token}` },
+                                });
+                                if (img.ok) {
+                                    return new Response(img.body, {
+                                        headers: {
+                                            "Content-Type": img.headers.get("Content-Type") || "image/jpeg",
+                                            "Cache-Control": "public, max-age=604800",
+                                            "Access-Control-Allow-Origin": "*",
+                                        },
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e) {
+                console.error({ message: "Miniatura no disponible", error: e.toString() });
+            }
+
+            // Sense miniatura: caràtula generada amb el títol imprès
+            return new Response(pngPortada(titol), {
                 headers: {
                     "Content-Type": "image/png",
-                    "Cache-Control": "public, max-age=31536000",
+                    "Cache-Control": "public, max-age=86400",
                     "Access-Control-Allow-Origin": "*",
                 },
             });
@@ -2142,12 +2328,17 @@ async function handleRequest(request) {
                 catch (e) { continue; }
                 totalSeries += carpetes.length;
                 for (const folder of carpetes) {
-                    if (llegeixMapa("s:" + folder.id)) continue;
+                    const previ = llegeixMapa("s:" + folder.id);
+                    // Un intent fallit NO és definitiu: la lògica de
+                    // reconeixement va millorant, així que els reintentem
+                    // unes quantes vegades abans de donar-los per perduts.
+                    if (previ && !calReintentar(previ)) continue;
                     if (!quedaPressupost(8)) { pendents++; continue; }
                     const r = await getTmdbPosterByName(folder.name, { preferTv: true });
-                    escriuMapa("s:" + folder.id, r
+                    escriuMapa("s:" + folder.id, r?.imdbId
                         ? { imdbId: r.imdbId, poster: r.poster, background: r.background, title: r.title }
-                        : { imdbId: null, poster: null, background: null, title: null });
+                        : { imdbId: null, poster: r?.poster || null, background: r?.background || null,
+                            title: r?.title || null, intents: (previ?.intents || 0) + 1 });
                     resoltes++;
                 }
             }
@@ -2164,12 +2355,14 @@ async function handleRequest(request) {
                 const videos = fitxers.filter((f) => VIDEO_EXT_REGEX.test(f.name));
                 totalPelis += videos.length;
                 for (const file of videos) {
-                    if (llegeixMapa("m:" + file.id)) continue;
+                    const previ = llegeixMapa("m:" + file.id);
+                    if (previ && !calReintentar(previ)) continue;
                     if (!quedaPressupost(8)) { pendents++; continue; }
                     const r = await getTmdbPosterByName(file.name);
-                    escriuMapa("m:" + file.id, r
+                    escriuMapa("m:" + file.id, r?.imdbId
                         ? { imdbId: r.imdbId, poster: r.poster, background: r.background, title: r.title }
-                        : { imdbId: null, poster: null, background: null, title: null });
+                        : { imdbId: null, poster: r?.poster || null, background: r?.background || null,
+                            title: r?.title || null, intents: (previ?.intents || 0) + 1 });
                     resoltes++;
                 }
             }
@@ -2290,7 +2483,7 @@ ${acabat
                 name: dades?.title || name,
                 type: "movie",
                 posterShape: "poster",
-                poster: dades?.poster || thumbnail || posterGenerat(dades?.title || name),
+                poster: dades?.poster || posterGenerat(dades?.title || name, { fileId: id }),
                 background: dades?.background || thumbnail || null,
                 description:
                     `Mida: ${formatSize(size)}` +
@@ -2458,7 +2651,7 @@ ${acabat
                             type: "series",
                             name: dades.title || folder.name,
                             posterShape: "poster",
-                            poster: dades.poster || posterGenerat(dades.title || folder.name),
+                            poster: dades.poster || posterGenerat(dades.title || folder.name, { folderId: folder.id }),
                             background: dades.background || null,
                         });
                     } else {
@@ -2467,7 +2660,7 @@ ${acabat
                             type: "series",
                             name: folder.name,
                             posterShape: "poster",
-                            poster: dades.poster || posterGenerat(folder.name),
+                            poster: dades.poster || posterGenerat(folder.name, { folderId: folder.id }),
                             background: dades.background || null,
                         });
                     }
@@ -2479,7 +2672,7 @@ ${acabat
                         type: "series",
                         name: folder.name,
                         posterShape: "poster",
-                        poster: posterGenerat(folder.name),
+                        poster: posterGenerat(folder.name, { folderId: folder.id }),
                     });
                 }
 
