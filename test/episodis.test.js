@@ -190,6 +190,37 @@ console.log("\n── Temporades del Drive desalineades amb les de TMDB (cas Ina
   prova("col·lecció incompleta: el que sí existeix segueix sortint", unInc(2,45)?.includes("T2xC45"));
 }
 
+console.log("\n── Sèries germanes dins d'un contenidor de franquícia");
+{
+  const norm = ctx.normalitzaTitol;
+  const germana = (carpeta, titols) => ctx.esSerieGermana(carpeta, titols.map(norm));
+  const casos = [
+    // [carpeta, títols buscats, ha de ser germana?]
+    ["Bola de Drac Z [cat jap] [Albert Wesker]", ["Dragon Ball","Bola de Drac"], true],
+    ["Bola de Drac GT [cat jap]", ["Bola de Drac"], true],
+    ["Bola de Drac Super", ["Bola de Drac"], true],
+    ["Bola de Drac Kai", ["Bola de Drac"], true],
+    ["Inazuma Eleven GO", ["Inazuma Eleven"], true],
+    ["Inazuma Eleven GO Chrono Stones", ["Inazuma Eleven GO"], true],
+    ["Naruto Shippuden", ["Naruto"], true],
+    // Aquestes són parts de la MATEIXA sèrie i s'han de recórrer
+    ["Bola de Drac [cat jap] [Albert Wesker]", ["Bola de Drac"], false],
+    ["Bola de Drac Saga Freezer", ["Bola de Drac"], false],
+    ["Bola de Drac - Temporada 1", ["Bola de Drac"], false],
+    ["Bola de Drac Part 2", ["Bola de Drac"], false],
+    ["Bola de Drac 2", ["Bola de Drac"], false],
+    ["One Piece [1-500]", ["One Piece"], false],
+    ["One Piece [501-1000]", ["One Piece"], false],
+    ["El detectiu Conan [WebDl]", ["El detectiu Conan"], false],
+    ["Naruto", ["Naruto"], false],
+    ["Temporada 1", ["Bola de Drac"], false],
+    ["Bleach", ["Bola de Drac"], false],
+  ];
+  const fallats = casos.filter(([c, t, esp]) => germana(c, t) !== esp);
+  prova(`${casos.length} carpetes classificades bé com a germana o part`, fallats.length === 0);
+  if (fallats.length) console.log("      fallats:", fallats.map((x) => x[0]).join(", "));
+}
+
 console.log("\n"+"═".repeat(72));
 console.log(fall===0 ? `TOTES LES ${total} PROVES PASSEN` : `${fall} de ${total} PROVES FALLEN`);
 process.exit(fall?1:0);

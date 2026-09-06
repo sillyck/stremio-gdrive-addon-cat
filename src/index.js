@@ -81,7 +81,7 @@ const CONFIG = {
 
 // Identificador de la versió del codi. Serveix per verificar via /versio
 // quina versió s'està executant realment al worker.
-const VERSIO_CODI = "2026-09-06.reserva-absoluta-protegida";
+const VERSIO_CODI = "2026-09-06.series-germanes";
 
 const MANIFEST = {
     id: "stremio.gdrive.worker.cat",
@@ -1813,16 +1813,17 @@ function esCarpetaDExtres(nom) {
 // automàticament tots els recorreguts desats. Sense això, un canvi als
 // filtres d'extres trigava un dia a notar-se perquè el cau servia l'arbre
 // antic, amb els extres inclosos.
-function clauCauRecorregut(folderId) {
+function clauCauRecorregut(folderId, marca = "") {
     const v = VERSIO_CODI.replace(/[^a-zA-Z0-9._-]/g, "_");
-    return `https://gdrive-addon.local/__walk/${v}/${folderId}`;
+    const m = marca ? "/" + encodeURIComponent(marca) : "";
+    return `https://gdrive-addon.local/__walk/${v}/${folderId}${m}`;
 }
 
-async function llegeixRecorregutDelCau(folderId) {
+async function llegeixRecorregutDelCau(folderId, marca = "") {
     try {
         if (!CONFIG.usaCauRecorregut) return null;
         if (typeof caches === "undefined" || !consumeix(1)) return null;
-        const r = await caches.default.match(new Request(clauCauRecorregut(folderId)));
+        const r = await caches.default.match(new Request(clauCauRecorregut(folderId, marca)));
         if (!r) return null;
         const dades = await r.json();
         console.log({ message: "Recorregut recuperat del cau", folderId, fitxers: dades.length });
@@ -1832,7 +1833,7 @@ async function llegeixRecorregutDelCau(folderId) {
     }
 }
 
-async function desaRecorregutAlCau(folderId, fitxers) {
+async function desaRecorregutAlCau(folderId, fitxers, marca = "") {
     try {
         if (!CONFIG.usaCauRecorregut) return;
         if (typeof caches === "undefined") return;
@@ -1842,10 +1843,51 @@ async function desaRecorregutAlCau(folderId, fitxers) {
                 "Cache-Control": "max-age=86400",   // un dia
             },
         });
-        const promesa = caches.default.put(new Request(clauCauRecorregut(folderId)), r);
+        const promesa = caches.default.put(new Request(clauCauRecorregut(folderId, marca)), r);
         if (globalThis.__ctx?.waitUntil) globalThis.__ctx.waitUntil(promesa);
         else await promesa;
     } catch (e) { /* el cau és una optimització, no una dependència */ }
+}
+
+// Paraules que, quan segueixen el títol d'una sèrie, indiquen una DIVISIÓ
+// INTERNA (temporada, arc, tanda) i no una sèrie diferent.
+const MARQUES_DIVISIO = new Set([
+    "temporada", "temporades", "season", "seasons", "saga", "sagues", "sagas",
+    "arc", "arcs", "part", "parts", "parte", "partes", "vol", "volum", "volume",
+    "capitol", "capitols", "capitulo", "capitulos", "episodi", "episodis",
+    "episode", "episodes", "batch", "complete", "completa", "complet",
+    "integral", "remaster", "remastered", "bluray", "bd", "dvd", "web",
+    "webdl", "webrip", "hd", "sd", "dual", "multi", "audio", "subs",
+    "cat", "esp", "eng", "jap", "val", "cas", "latino", "castella", "catala",
+]);
+
+// Diu si una subcarpeta és una SÈRIE GERMANA (una altra obra de la mateixa
+// franquícia) en comptes d'una part de la que busquem.
+//
+// "Bola de Drac Z"        → sèrie germana  (Z no és una marca de divisió)
+// "Bola de Drac GT"       → sèrie germana
+// "Bola de Drac Saga Freezer" → part de la mateixa sèrie (comença per "saga")
+// "Bola de Drac Temporada 1"  → part (el netejat ja hi treu la temporada)
+// "One Piece [501-1000]"  → part (un cop netejat és idèntic al títol)
+function esSerieGermana(nomCarpeta, titolsNorm) {
+    if (!titolsNorm?.length) return false;
+    const net = normalitzaTitol(cleanTitleForSearch(nomCarpeta).queries[0] || nomCarpeta);
+    if (!net) return false;
+
+    for (const t of titolsNorm) {
+        if (!t || net === t) return false;          // és la mateixa: no és germana
+        if (!net.startsWith(t + " ")) continue;     // no comparteix el títol: no en sabem res
+
+        const extra = net.slice(t.length).trim().split(/\s+/).filter(Boolean);
+        if (extra.length === 0) return false;
+        // Si el que ve després és una marca de divisió (o un número solt),
+        // és una part de la mateixa sèrie.
+        const primera = extra[0];
+        if (MARQUES_DIVISIO.has(primera) || /^\d+$/.test(primera)) return false;
+        // Altrament, el títol s'allarga amb paraules pròpies: és una altra obra
+        return true;
+    }
+    return false;
 }
 
 // Algunes carpetes no són una sèrie sinó un contenidor de FRANQUÍCIA. Per
@@ -1881,12 +1923,18 @@ async function afinaCarpetaDeSerie(rootFolderId, titols, accessToken) {
     return rootFolderId;
 }
 
-async function walkCollectionFiles(rootFolderId, accessToken, maxDepth = 6) {
-    const delCau = await llegeixRecorregutDelCau(rootFolderId);
+async function walkCollectionFiles(rootFolderId, accessToken, maxDepth = 6, titolsSerie = []) {
+    const titolsNorm = (titolsSerie || []).map(normalitzaTitol).filter(Boolean);
+    // La marca fa que el cau distingeixi la mateixa carpeta demanada per
+    // sèries diferents de la franquícia: el resultat no és el mateix.
+    const marcaCau = titolsNorm.slice().sort().join("|").slice(0, 80);
+
+    const delCau = await llegeixRecorregutDelCau(rootFolderId, marcaCau);
     if (delCau) return delCau;
 
     const resultats = [];
     const saltades = [];
+    const germanes = [];
     const fitxersOmesos = [];
     let complet = true;
 
@@ -1904,6 +1952,12 @@ async function walkCollectionFiles(rootFolderId, accessToken, maxDepth = 6) {
                     saltades.push([...ruta, item.name].join("/"));
                     continue;
                 }
+                // Una altra sèrie de la mateixa franquícia dins la carpeta:
+                // els seus episodis no són els d'aquesta sèrie.
+                if (esSerieGermana(item.name, titolsNorm)) {
+                    germanes.push([...ruta, item.name].join("/"));
+                    continue;
+                }
                 await recorre(item.id, [...ruta, item.name], profunditat + 1);
             } else if (VIDEO_EXT_REGEX.test(item.name)) {
                 if (esFitxerNoEpisodi(item.name)) {
@@ -1919,6 +1973,9 @@ async function walkCollectionFiles(rootFolderId, accessToken, maxDepth = 6) {
     if (saltades.length) {
         console.log({ message: "Carpetes d'extres omeses", saltades: saltades.slice(0, 12) });
     }
+    if (germanes.length) {
+        console.log({ message: "Sèries germanes de la franquícia omeses", germanes: germanes.slice(0, 10) });
+    }
     if (fitxersOmesos.length) {
         console.log({ message: "Fitxers que no són episodis, omesos",
                       quants: fitxersOmesos.length, mostra: fitxersOmesos.slice(0, 8) });
@@ -1926,7 +1983,7 @@ async function walkCollectionFiles(rootFolderId, accessToken, maxDepth = 6) {
     // Només desem el recorregut si ha estat COMPLET. Desar-ne un de truncat
     // congelaria una llista incompleta durant tot un dia.
     if (complet && resultats.length > 0) {
-        await desaRecorregutAlCau(rootFolderId, resultats);
+        await desaRecorregutAlCau(rootFolderId, resultats, marcaCau);
         console.log({ message: "Recorregut complet desat al cau", rootFolderId, fitxers: resultats.length });
     } else if (!complet) {
         console.log({ message: "Recorregut incomplet: no es desa al cau", rootFolderId, fitxers: resultats.length });
@@ -3366,7 +3423,7 @@ async function getStreams(streamRequest) {
                         break;
                     }
                     const folderId = await afinaCarpetaDeSerie(folderIdBrut, titolsSerie, accessToken);
-                    const fitxersRuta = await walkCollectionFiles(folderId, accessToken);
+                    const fitxersRuta = await walkCollectionFiles(folderId, accessToken, 6, titolsSerie);
                     fitxersRevisats += fitxersRuta.length;
 
                     const { matches, estrategia } = trobaEpisodis(
