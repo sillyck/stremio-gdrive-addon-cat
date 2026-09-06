@@ -73,7 +73,7 @@ const CONFIG = {
 
 // Identificador de la versió del codi. Serveix per verificar via /versio
 // quina versió s'està executant realment al worker.
-const VERSIO_CODI = "2026-09-06.esquema-episodis-unificat";
+const VERSIO_CODI = "2026-09-06.getSeasonStructure-restaurada+lint";
 
 const MANIFEST = {
     id: "stremio.gdrive.worker.cat",
@@ -1752,6 +1752,48 @@ async function walkCollectionFiles(rootFolderId, accessToken, maxDepth = 6) {
 
 // El separador pot ser una "x" llatina o el signe de multiplicació "×" (U+00D7),
 // que és el que fan servir molts arxius i el que feia fallar el reconeixement.
+// Obté quants episodis té cada temporada segons TMDB. Això és el que permet
+// convertir una numeració absoluta (ex. One Piece 001..1100) a season/episode
+// i viceversa, que és la causa principal del desordre d'episodis.
+async function getSeasonStructure(imdbId) {
+    if (SEASON_STRUCTURE_CACHE.has(imdbId)) return SEASON_STRUCTURE_CACHE.get(imdbId);
+    if (!CONFIG.tmdbApiKey) return null;
+
+    try {
+        const findUrl = API_ENDPOINTS.TMDB_FIND
+            .replace("{id}", imdbId)
+            .replace("{apiKey}", CONFIG.tmdbApiKey);
+        const findRes = await fetch(findUrl);
+        if (!findRes.ok) return null;
+        const findData = await findRes.json();
+        const tv = findData.tv_results?.[0];
+        if (!tv) {
+            SEASON_STRUCTURE_CACHE.set(imdbId, null);
+            return null;
+        }
+
+        const tvUrl = API_ENDPOINTS.TMDB_TV
+            .replace("{id}", tv.id)
+            .replace("{apiKey}", CONFIG.tmdbApiKey)
+            .replace("{lang}", "en");
+        const tvRes = await fetch(tvUrl);
+        if (!tvRes.ok) return null;
+        const tvData = await tvRes.json();
+
+        // Comptes d'episodis per temporada, ignorant la temporada 0 (especials)
+        const counts = [];
+        for (const s of tvData.seasons || []) {
+            if (s.season_number === 0) continue;
+            counts[s.season_number] = s.episode_count || 0;
+        }
+        const structure = counts.length > 1 ? counts : null;
+        SEASON_STRUCTURE_CACHE.set(imdbId, structure);
+        return structure;
+    } catch (e) {
+        return null;
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // NUMERACIÓ D'EPISODIS
 //
@@ -1994,6 +2036,10 @@ function buildBaseSearchQuery(query) {
 }
 
 async function buildSearchQuery(streamRequest) {
+    // Sense metadata externa no es pot construir la cerca per títol. No és un
+    // error: vol dir que aquest camí de reserva no és aplicable i que ja
+    // s'han provat abans les vies fiables (mapa i coincidència de carpeta).
+    if (!streamRequest.metadata?.name) return null;
     const { name, year } = streamRequest.metadata;
 
     let query =
@@ -2755,7 +2801,13 @@ ${acabat
 
         const metadata = await getMetadata(type, fullId);
 
-        if (!metadata) return createJsonResponse({ streams: [] });
+        // Que Cinemeta/TMDB/IMDb no responguin NO vol dir que no puguem
+        // servir res: si el mapa ja associa aquest IMDb ID amb un fitxer del
+        // Drive, la metadata externa és prescindible. Abans es retornava una
+        // llista buida i el títol quedava sense cap opció de reproducció.
+        if (!metadata) {
+            console.log({ message: "Sense metadata externa; provo pel mapa", fullId });
+        }
 
         const parsedStreamRequest = {
             type: type,
@@ -3095,8 +3147,12 @@ async function getStreams(streamRequest) {
         }
     }
 
-    // Fallback: cerca per títol a Google Drive (comportament original)
+    // Reserva: cerca per títol a Google Drive (comportament original)
     const query = await buildSearchQuery(streamRequest);
+    if (!query) {
+        console.log({ message: "Sense metadata: no hi ha cerca de reserva possible", id: streamRequest.id });
+        return streams;
+    }
     console.log({ message: "Built search query (fallback)", query, config: CONFIG });
 
     const queryParams = {
@@ -3137,7 +3193,7 @@ async function getStreams(streamRequest) {
         files: results.files,
     });
 
-    const nameRegex = new RegExp(
+    const nameRegex = !streamRequest.metadata?.name ? null : new RegExp(
         "(?<![^ [(_\\-.])(" +
             streamRequest.metadata.name
                 .replace(/[^\w\s]/g, "[^\\w\\s]?")
@@ -3151,7 +3207,7 @@ async function getStreams(streamRequest) {
     console.log({ message: "Name regex", nameRegex });
     const parsedFiles = parseAndFilterFiles(
         CONFIG.strictTitleCheck
-            ? results.files.filter((file) => nameRegex.test(file.name))
+            ? results.files.filter((file) => !nameRegex || nameRegex.test(file.name))
             : results.files
     );
 

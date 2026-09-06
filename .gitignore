@@ -174,4 +174,5 @@ dist
 # editor files
 
 .vscode/
-.prettierrc
+.prettierrcnode_modules/
+coverage/

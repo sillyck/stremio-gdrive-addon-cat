@@ -5,9 +5,13 @@
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
-    "start": "wrangler dev"
+    "start": "wrangler dev",
+    "lint": "eslint src/index.js",
+    "test": "node test/episodis.test.js",
+    "verify": "npm run lint && npm run test"
   },
   "devDependencies": {
-    "wrangler": "^4.0.0"
+    "wrangler": "^4.0.0",
+    "eslint": "^9.0.0"
   }
 }
