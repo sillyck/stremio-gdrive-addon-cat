@@ -77,6 +77,10 @@ const MANIFEST = {
 const IMDB_TO_GDRIVE = new Map(); // "tt1234567" → { type: "series"|"movie", id: "folderId/fileId" }
 // Cache TMDB per evitar crides repetides i rate limiting
 const TMDB_CACHE = new Map(); // "nom_netejat" → { poster, background, imdbId, tmdbType }
+// Cache de l'estructura de temporades: imdbId → [n_eps_T1, n_eps_T2, ...]
+const SEASON_STRUCTURE_CACHE = new Map();
+// Cache de títols alternatius: imdbId → ["Dragon Ball", "Bola de Drac", ...]
+const TITLES_CACHE = new Map();
 
 // Limitar concurrència per no superar rate limits de TMDB (~40 req/10s)
 async function processInBatches(items, fn, batchSize = 5, delayMs = 250) {
@@ -112,6 +116,7 @@ const API_ENDPOINTS = {
     TMDB_DETAILS: "https://api.themoviedb.org/3/{type}/{id}?api_key={apiKey}",
     TMDB_SEARCH: "https://api.themoviedb.org/3/search/multi?api_key={apiKey}&query={query}&page=1",
     TMDB_EXTERNAL_IDS: "https://api.themoviedb.org/3/{type}/{id}/external_ids?api_key={apiKey}",
+    TMDB_TV: "https://api.themoviedb.org/3/tv/{id}?api_key={apiKey}&language={lang}",
 };
 
 const REGEX_PATTERNS = {
@@ -306,38 +311,71 @@ function compareByField(a, b, field) {
     return 0;
 }
 
-function createStream(parsedFile, accessToken) {
-    let name = parsedFile.type.startsWith("audio")
-        ? `[🎵 Audio] ${MANIFEST.name} ${parsedFile.extension.toUpperCase()}`
-        : `${MANIFEST.name} ${parsedFile.resolution}`;
+// Treu del nom d'un fitxer el títol "net" de l'episodi: sense extensió, sense
+// etiquetes tècniques i sense el patró de numeració, per poder mostrar-lo tal
+// qual a Stremio (ex. "One Piece - 01x01 - ¡Yo soy Luffy!.mkv" → "¡Yo soy Luffy!")
+function titolEpisodiDeNom(nomArxiu, titolsSerie = []) {
+    let t = nomArxiu
+        .replace(/\.[a-z0-9]{2,4}$/i, "")
+        .replace(/\[.*?\]/g, " ")
+        .replace(/\((?:[^)]*(?:\d{3,4}p|cat|esp|eng|jap|sub|dub|FLAC|DTS|AVC|BD|HD)[^)]*)\)/gi, " ")
+        .replace(SXE_REGEX, " ")
+        .replace(NXM_REGEX, " ")
+        .replace(TEMPORADA_EP_REGEX, " ")
+        .replace(EP_EXPLICIT_REGEX, " ")
+        .replace(/\b\d{3,4}p\b/gi, " ")
+        .replace(/\b(?:x26[45]|h\.?26[45]|HEVC|AVC|AAC|FLAC|DTS|AC3|DD[P+]?\d?(?:\.\d)?|Atmos|DoVi|HDR\d*)\b/gi, " ")
+        .replace(/\b(?:BluRay|BDRemux|BDRip|WEB-?DL|WEBRip|HDRip|DVDRip|HDTV|REMUX|UHD)\b/gi, " ")
+        .replace(/[-_.]+/g, " ")
+        .replace(/\s{2,}/g, " ")
+        .trim();
+    // Treu el nom de la sèrie del davant: volem NOMÉS el títol de l'episodi
+    for (const titol of titolsSerie) {
+        if (!titol) continue;
+        const esc = titol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        t = t.replace(new RegExp("^\\s*" + esc + "\\s*[-–:_]*\\s*", "i"), "").trim();
+    }
+    t = t.replace(/^[-–:_\s]+/, "").trim();
+    // I el número d'episodi que sovint queda al davant ("031 El Gran Torneig")
+    t = t.replace(/^\d{1,4}\s*[-–:_]*\s*/, "").trim();
 
-    let description = `🎥 ${parsedFile.quality}   ${
-        parsedFile.encode ? "🎞️ " + parsedFile.encode : ""
-    }`;
+    // Si després de netejar només queden números o queda buit, no serveix
+    if (!t || /^[\d\s]*$/.test(t)) return null;
+    return t;
+}
 
-    if (parsedFile.visualTags.length > 0 || parsedFile.audioTags.length > 0) {
-        description += "\n";
-
-        description +=
-            parsedFile.visualTags.length > 0
-                ? `📺 ${parsedFile.visualTags.join(" | ")}   `
-                : "";
-        description +=
-            parsedFile.audioTags.length > 0
-                ? `🎧 ${parsedFile.audioTags.join(" | ")}`
-                : "";
+function createStream(parsedFile, accessToken, epInfo = null) {
+    // Nom: títol de l'episodi + SxxEyy (punt simple i llegible).
+    // Per pel·lícules o quan no hi ha info d'episodi, el nom mostra la qualitat.
+    let name;
+    if (epInfo) {
+        const codi = `S${String(epInfo.season).padStart(2, "0")}E${String(epInfo.episode).padStart(2, "0")}`;
+        const titol = epInfo.title ? `${epInfo.title} · ${codi}` : codi;
+        name = `${titol}\n${parsedFile.resolution}`;
+    } else {
+        name = parsedFile.type.startsWith("audio")
+            ? `[🎵] ${parsedFile.extension?.toUpperCase() || "Audio"}`
+            : `${MANIFEST.name} ${parsedFile.resolution}`;
     }
 
-    description += `\n📦 ${parsedFile.formattedSize}`;
-    if (parsedFile.languages.length !== 0) {
-        description += `\n🔊 ${parsedFile.languages.join(" | ")}`;
+    // Descripció: pistes d'àudio i duració en primer lloc, com has demanat.
+    const linies = [];
+    if (parsedFile.languages.length > 0) {
+        linies.push(`🔊 ${parsedFile.languages.join(" · ")}`);
     }
-
-    description += `\n📄 ${parsedFile.name}`;
-
     if (parsedFile.duration) {
-        description += `\n⏱️ ${formatDuration(parsedFile.duration)}`;
+        linies.push(`⏱️ ${formatDuration(parsedFile.duration)}`);
     }
+    const tecnic = [
+        parsedFile.quality !== "Unknown" ? parsedFile.quality : null,
+        parsedFile.encode || null,
+        ...parsedFile.visualTags,
+        ...parsedFile.audioTags,
+    ].filter(Boolean);
+    if (tecnic.length > 0) linies.push(`🎞️ ${tecnic.join(" · ")}`);
+    linies.push(`📦 ${parsedFile.formattedSize}`);
+
+    let description = linies.join("\n");
     const combinedTags = [
         parsedFile.resolution,
         parsedFile.quality,
@@ -753,116 +791,121 @@ function cleanTitleForSearch(name) {
     return { queries, year };
 }
 
-async function getTmdbPosterByName(name) {
+async function getTmdbPosterByName(name, { preferTv = false } = {}) {
     if (!CONFIG.tmdbApiKey) return null;
 
-    // Comprovar cache
-    const cacheKey = name.toLowerCase().trim();
+    const cacheKey = (preferTv ? "tv:" : "any:") + name.toLowerCase().trim();
     if (TMDB_CACHE.has(cacheKey)) return TMDB_CACHE.get(cacheKey);
 
-    try {
-        const { queries, year } = cleanTitleForSearch(name);
-        if (queries.length === 0) return null;
+    const { queries, year } = cleanTitleForSearch(name);
+    if (queries.length === 0) return null;
 
-        for (const q of queries) {
-            // Buscar primer sense idioma (resultats globals), després ca, es
-            for (const lang of ["", "ca", "es", "en"]) {
-                const langParam = lang ? `&language=${lang}` : "";
-                const searchUrl = `https://api.themoviedb.org/3/search/multi?api_key=${CONFIG.tmdbApiKey}&query=${encodeURIComponent(q)}${langParam}&page=1` + (year ? `&year=${year}` : "");
-                const response = await fetch(searchUrl);
+    // Un resultat només es dona per bo si el títol s'assembla prou al que
+    // buscàvem. Això evita els "Dragon Ball" → "Dragon Ball Z" i companyia.
+    const normalitza = (t) => (t || "")
+        .toLowerCase()
+        .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+        .replace(/[^a-z0-9\s]/g, " ")
+        .replace(/\s+/g, " ").trim();
 
-                // Rate limit: esperar i reintentar
-                if (response.status === 429) {
-                    await new Promise(r => setTimeout(r, 1500));
-                    continue;
-                }
-                if (!response.ok) continue;
+    function puntua(result, consulta) {
+        const cand = [result.name, result.title, result.original_name, result.original_title]
+            .filter(Boolean).map(normalitza);
+        const q = normalitza(consulta);
+        if (cand.includes(q)) return 3;                       // coincidència exacta
+        if (cand.some((c) => c.startsWith(q) || q.startsWith(c))) return 2;
+        if (cand.some((c) => c.includes(q) || q.includes(c))) return 1;
+        return 0;
+    }
 
-                const data = await response.json();
-                const result = data.results?.[0];
-                if (!result) continue;
-
-                // Obtenir IMDB ID via external_ids
-                let imdbId = null;
-                const mediaType = result.media_type === "movie" ? "movie" : "tv";
-                try {
-                    const extUrl = API_ENDPOINTS.TMDB_EXTERNAL_IDS
-                        .replace("{type}", mediaType)
-                        .replace("{id}", result.id)
-                        .replace("{apiKey}", CONFIG.tmdbApiKey);
-                    const extRes = await fetch(extUrl);
-                    if (extRes.ok) {
-                        const extData = await extRes.json();
-                        imdbId = extData.imdb_id || null;
-                    }
-                } catch (e) { /* ignore */ }
-
-                if (imdbId) {
-                    // Posters via btttr.cc (sense rate limit) + fallback TMDB
-                    const out = {
-                        poster: `https://btttr.cc/poster-n/imdb/poster-default/${imdbId}.jpg`,
-                        background: result.backdrop_path ? `https://image.tmdb.org/t/p/w1280${result.backdrop_path}` : null,
-                        imdbId,
-                        tmdbType: result.media_type,
-                    };
-                    TMDB_CACHE.set(cacheKey, out);
-                    return out;
-                }
-
-                // Sense IMDB ID: encara podem retornar poster TMDB
-                if (result.poster_path || result.backdrop_path) {
-                    const out = {
-                        poster: result.poster_path ? `https://image.tmdb.org/t/p/w500${result.poster_path}` : null,
-                        background: result.backdrop_path ? `https://image.tmdb.org/t/p/w1280${result.backdrop_path}` : null,
-                        imdbId: null,
-                        tmdbType: result.media_type,
-                    };
-                    TMDB_CACHE.set(cacheKey, out);
-                    return out;
-                }
-            }
-        }
-
-        // Si hem fallat amb any, reintentar sense any
-        if (year && queries.length > 0) {
-            for (const q of queries) {
-                const searchUrl = `https://api.themoviedb.org/3/search/multi?api_key=${CONFIG.tmdbApiKey}&query=${encodeURIComponent(q)}&page=1`;
-                const response = await fetch(searchUrl);
-                if (!response.ok) continue;
-                const data = await response.json();
-                const result = data.results?.[0];
-                if (!result) continue;
-
-                let imdbId = null;
-                const mediaType = result.media_type === "movie" ? "movie" : "tv";
-                try {
-                    const extUrl = API_ENDPOINTS.TMDB_EXTERNAL_IDS
-                        .replace("{type}", mediaType)
-                        .replace("{id}", result.id)
-                        .replace("{apiKey}", CONFIG.tmdbApiKey);
-                    const extRes = await fetch(extUrl);
-                    if (extRes.ok) {
-                        const extData = await extRes.json();
-                        imdbId = extData.imdb_id || null;
-                    }
-                } catch (e) { /* ignore */ }
-
-                const out = {
-                    poster: imdbId
-                        ? `https://btttr.cc/poster-n/imdb/poster-default/${imdbId}.jpg`
-                        : (result.poster_path ? `https://image.tmdb.org/t/p/w500${result.poster_path}` : null),
-                    background: result.backdrop_path ? `https://image.tmdb.org/t/p/w1280${result.backdrop_path}` : null,
-                    imdbId,
-                    tmdbType: result.media_type,
-                };
-                TMDB_CACHE.set(cacheKey, out);
-                return out;
-            }
-        }
-
-        TMDB_CACHE.set(cacheKey, null);
+    async function resolImdb(result) {
+        try {
+            const mediaType = result.media_type === "movie" ? "movie" : "tv";
+            const extUrl = API_ENDPOINTS.TMDB_EXTERNAL_IDS
+                .replace("{type}", mediaType)
+                .replace("{id}", result.id)
+                .replace("{apiKey}", CONFIG.tmdbApiKey);
+            const extRes = await fetch(extUrl);
+            if (extRes.ok) return (await extRes.json()).imdb_id || null;
+        } catch (e) { /* ignore */ }
         return null;
+    }
+
+    async function cerca(endpoint, q, lang, useYear) {
+        const params = new URLSearchParams({ api_key: CONFIG.tmdbApiKey, query: q, page: "1" });
+        if (lang) params.set("language", lang);
+        if (useYear && year) params.set(endpoint === "tv" ? "first_air_date_year" : "year", year);
+        const url = `https://api.themoviedb.org/3/search/${endpoint}?${params}`;
+        const res = await fetch(url);
+        if (res.status === 429) {
+            await new Promise((r) => setTimeout(r, 1500));
+            return null;
+        }
+        if (!res.ok) return null;
+        const data = await res.json();
+        return data.results || null;
+    }
+
+    try {
+        // Ordre d'endpoints: si sabem que és una sèrie, "tv" primer i multi com
+        // a últim recurs. Idiomes: català i castellà primer (els nostres noms
+        // de carpeta són en català), després global i anglès.
+        const endpoints = preferTv ? ["tv", "multi"] : ["multi", "movie", "tv"];
+        const langs = ["ca", "es", "", "en"];
+
+        let millor = null;   // { result, score }
+
+        for (const useYear of [true, false]) {
+            for (const q of queries) {
+                for (const endpoint of endpoints) {
+                    for (const lang of langs) {
+                        const results = await cerca(endpoint, q, lang, useYear);
+                        if (!results || results.length === 0) continue;
+
+                        for (const r of results.slice(0, 5)) {
+                            if (preferTv && r.media_type === "movie") continue;
+                            const mt = r.media_type || (endpoint === "tv" ? "tv" : "movie");
+                            const score = puntua(r, q);
+                            if (score === 0) continue;
+                            if (!millor || score > millor.score) {
+                                millor = { result: { ...r, media_type: mt }, score };
+                            }
+                            if (score === 3) break;
+                        }
+                        if (millor?.score === 3) break;
+                    }
+                    if (millor?.score === 3) break;
+                }
+                if (millor?.score === 3) break;
+            }
+            if (millor) break;   // ja tenim alguna cosa amb any; no repetim sense
+        }
+
+        if (!millor) {
+            TMDB_CACHE.set(cacheKey, null);
+            return null;
+        }
+
+        const result = millor.result;
+        const imdbId = await resolImdb(result);
+        const out = {
+            // btttr.cc no té límit de peticions; TMDB com a alternativa
+            poster: imdbId
+                ? `https://btttr.cc/poster-n/imdb/poster-default/${imdbId}.jpg`
+                : (result.poster_path ? `https://image.tmdb.org/t/p/w500${result.poster_path}` : null),
+            background: result.backdrop_path
+                ? `https://image.tmdb.org/t/p/w1280${result.backdrop_path}`
+                : null,
+            imdbId,
+            tmdbId: result.id,
+            tmdbType: result.media_type,
+            title: result.name || result.title || null,
+            score: millor.score,
+        };
+        TMDB_CACHE.set(cacheKey, out);
+        return out;
     } catch (e) {
+        console.error({ message: "getTmdbPosterByName failed", name, error: e.toString() });
         return null;
     }
 }
@@ -1109,18 +1152,106 @@ async function walkCollectionFiles(rootFolderId, accessToken, maxDepth = 6) {
     return resultats;
 }
 
-const SXE_REGEX = /s(\d{1,2})[ ._-]?e(\d{1,3})/i;
-const NXM_REGEX = /(\d{1,2})x(\d{1,3})/i;
-const NUMERO_PLA_REGEX = /(\d{2,4})(?!\d)/;
+const SXE_REGEX = /\bs(\d{1,2})[ ._-]?e(\d{1,3})\b/i;
+const NXM_REGEX = /\b(\d{1,2})x(\d{1,3})\b/i;
+const TEMPORADA_EP_REGEX = /\b(?:temporada|season|saga|temp|st)[\s._-]*(\d{1,2})[\s._-]*(?:cap[íi]tol|episodi|episode|ep|cap)[\s._-]*(\d{1,3})\b/i;
+const EP_EXPLICIT_REGEX = /\b(?:cap[íi]tol|episodi|episode|ep|cap)[\s._-]*(\d{1,3})\b/i;
+// Número solt: prioritza el que està separat per guions/espais (ex. "Bola de Drac - 042 - Títol")
+const NUMERO_SEPARAT_REGEX = /(?:^|[\s._-])(\d{1,3})(?=[\s._-]|$)/;
+const NUMERO_PLA_REGEX = /(\d{1,4})(?!\d)/;
+
+// Treu de l'anàlisi trossos del nom que contenen números que NO són episodis
+// (resolucions, anys, codecs, mides) per evitar falsos positius.
+function netejaSorollNumeric(nom) {
+    return nom
+        .replace(/\.[a-z0-9]{2,4}$/i, "")
+        .replace(/\[.*?\]/g, " ")
+        .replace(/\b\d{3,4}p\b/gi, " ")
+        .replace(/\b(?:19|20)\d{2}\b/g, " ")
+        .replace(/\bx26[45]\b/gi, " ")
+        .replace(/\bh\.?26[45]\b/gi, " ")
+        .replace(/\b\d+(?:\.\d+)?\s*(?:GB|MB|kbps|fps|bit)\b/gi, " ")
+        .replace(/\b(?:AC3|DTS|AAC|FLAC|DD)\s*\d?(?:\.\d)?\b/gi, " ")
+        .replace(/\b\d+\s*ch\b/gi, " ")
+        .replace(/\b4K\b/gi, " ");
+}
 
 function extreuNumeroEpisodi(nomArxiu) {
-    let m = SXE_REGEX.exec(nomArxiu);
+    const net = netejaSorollNumeric(nomArxiu);
+
+    let m = SXE_REGEX.exec(net);
     if (m) return { season: parseInt(m[1], 10), episode: parseInt(m[2], 10), font: "SxE" };
-    m = NXM_REGEX.exec(nomArxiu);
+
+    m = TEMPORADA_EP_REGEX.exec(net);
+    if (m) return { season: parseInt(m[1], 10), episode: parseInt(m[2], 10), font: "SxE" };
+
+    m = NXM_REGEX.exec(net);
     if (m) return { season: parseInt(m[1], 10), episode: parseInt(m[2], 10), font: "NxM" };
-    m = NUMERO_PLA_REGEX.exec(nomArxiu);
+
+    m = EP_EXPLICIT_REGEX.exec(net);
     if (m) return { season: null, episode: parseInt(m[1], 10), font: "pla" };
+
+    m = NUMERO_SEPARAT_REGEX.exec(net);
+    if (m) return { season: null, episode: parseInt(m[1], 10), font: "pla" };
+
+    m = NUMERO_PLA_REGEX.exec(net);
+    if (m) return { season: null, episode: parseInt(m[1], 10), font: "pla" };
+
     return null;
+}
+
+// Obté quants episodis té cada temporada segons TMDB. Això és el que permet
+// convertir una numeració absoluta (ex. One Piece 001..1100) a season/episode
+// i viceversa, que és la causa principal del desordre d'episodis.
+async function getSeasonStructure(imdbId) {
+    if (SEASON_STRUCTURE_CACHE.has(imdbId)) return SEASON_STRUCTURE_CACHE.get(imdbId);
+    if (!CONFIG.tmdbApiKey) return null;
+
+    try {
+        const findUrl = API_ENDPOINTS.TMDB_FIND
+            .replace("{id}", imdbId)
+            .replace("{apiKey}", CONFIG.tmdbApiKey);
+        const findRes = await fetch(findUrl);
+        if (!findRes.ok) return null;
+        const findData = await findRes.json();
+        const tv = findData.tv_results?.[0];
+        if (!tv) {
+            SEASON_STRUCTURE_CACHE.set(imdbId, null);
+            return null;
+        }
+
+        const tvUrl = API_ENDPOINTS.TMDB_TV
+            .replace("{id}", tv.id)
+            .replace("{apiKey}", CONFIG.tmdbApiKey)
+            .replace("{lang}", "en");
+        const tvRes = await fetch(tvUrl);
+        if (!tvRes.ok) return null;
+        const tvData = await tvRes.json();
+
+        // Comptes d'episodis per temporada, ignorant la temporada 0 (especials)
+        const counts = [];
+        for (const s of tvData.seasons || []) {
+            if (s.season_number === 0) continue;
+            counts[s.season_number] = s.episode_count || 0;
+        }
+        const structure = counts.length > 1 ? counts : null;
+        SEASON_STRUCTURE_CACHE.set(imdbId, structure);
+        return structure;
+    } catch (e) {
+        return null;
+    }
+}
+
+// Converteix season/episode → número absolut fent servir l'estructura TMDB.
+// Ex. amb T1=26 episodis, S02E05 → absolut 31.
+function aAbsolut(season, episode, structure) {
+    if (!structure) return null;
+    let total = 0;
+    for (let s = 1; s < season; s++) {
+        if (structure[s] == null) return null;
+        total += structure[s];
+    }
+    return total + episode;
 }
 
 // Treu el primer número que apareix en un nom de carpeta (ex. "Saga 02" -> 2,
@@ -1223,6 +1354,89 @@ function assignaEpisodis(fitxersRuta) {
     return episodis;
 }
 
+// Analitza tots els fitxers d'una col·lecció i n'extreu la informació
+// d'episodi, incloent-hi el context de la carpeta contenidora (que sovint
+// indica la temporada quan el nom del fitxer no ho fa).
+function analitzaFitxers(fitxersRuta) {
+    return fitxersRuta.map((item) => {
+        const nomArxiu = item.ruta[item.ruta.length - 1];
+        const info = extreuNumeroEpisodi(nomArxiu);
+        // Temporada segons la carpeta contenidora (ex. "Temporada 2", "Saga 03")
+        let seasonCarpeta = null;
+        for (let i = item.ruta.length - 2; i >= 0; i--) {
+            const carpeta = item.ruta[i];
+            const m = /\b(?:temporada|season|saga|temp|t|s)[\s._-]*(\d{1,2})\b/i.exec(carpeta);
+            if (m) { seasonCarpeta = parseInt(m[1], 10); break; }
+            const soloNum = /^(\d{1,2})$/.exec(carpeta.trim());
+            if (soloNum) { seasonCarpeta = parseInt(soloNum[1], 10); break; }
+        }
+        // Candidat secundari: el primer número "aïllat" del nom. Serveix quan
+        // el nom conté tant una numeració absoluta com una paraula com
+        // "episodi N" dins del títol de l'episodi.
+        let numeroInicial = null;
+        const mi = NUMERO_SEPARAT_REGEX.exec(netejaSorollNumeric(nomArxiu));
+        if (mi) numeroInicial = parseInt(mi[1], 10);
+
+        return {
+            file: item.file,
+            ruta: item.ruta,
+            nomArxiu,
+            season: info?.season ?? null,
+            episode: info?.episode ?? null,
+            font: info?.font ?? "cap",
+            seasonCarpeta,
+            numeroInicial,
+        };
+    });
+}
+
+// Troba els fitxers que corresponen a la temporada/episodi demanats.
+// Prova diverses estratègies en ordre de fiabilitat i retorna la primera
+// que doni resultats — així funciona tant si els fitxers estan numerats
+// SxxEyy, com per temporada en carpetes, com amb numeració absoluta.
+function trobaEpisodis(fitxersRuta, targetSeason, targetEpisode, structure) {
+    const items = analitzaFitxers(fitxersRuta);
+    const absolut = aAbsolut(targetSeason, targetEpisode, structure);
+
+    // 1. SxxEyy explícit al nom del fitxer — el senyal més fiable
+    let matches = items.filter(
+        (i) => i.font !== "pla" && i.font !== "cap" &&
+               i.season === targetSeason && i.episode === targetEpisode
+    );
+    if (matches.length) return { matches, estrategia: "SxE" };
+
+    // 2. Temporada per carpeta + número d'episodi al fitxer
+    matches = items.filter(
+        (i) => i.seasonCarpeta === targetSeason && i.episode === targetEpisode
+    );
+    if (matches.length) return { matches, estrategia: "carpeta+ep" };
+
+    // 3. Numeració absoluta (One Piece 001..1100) via estructura TMDB
+    if (absolut != null) {
+        matches = items.filter(
+            (i) => (i.font === "pla" || i.season == null) &&
+                   (i.episode === absolut || i.numeroInicial === absolut)
+        );
+        if (matches.length) return { matches, estrategia: "absolut" };
+    }
+
+    // 4. Sèrie d'una sola temporada (o carpeta plana): número directe
+    if (targetSeason === 1) {
+        matches = items.filter(
+            (i) => (i.font === "pla" || i.season == null) &&
+                   (i.episode === targetEpisode || i.numeroInicial === targetEpisode)
+        );
+        if (matches.length) return { matches, estrategia: "pla-T1" };
+    }
+
+    // 5. Últim recurs: qualsevol fitxer amb aquest número d'episodi,
+    //    ordenant per posició dins la carpeta per donar el més probable primer
+    matches = items.filter((i) => i.episode === targetEpisode);
+    if (matches.length) return { matches, estrategia: "número-solt" };
+
+    return { matches: [], estrategia: "cap" };
+}
+
 function buildBaseSearchQuery(query) {
     query = query.replace(/'/g, "\\'");
     let q = `name contains '${query}' and trashed=false and not name contains 'trailer' and not name contains 'sample'`;
@@ -1319,6 +1533,29 @@ async function buildSearchQuery(streamRequest) {
     return query;
 }
 
+
+// Diverses versions del mateix títol (qualitats/idiomes diferents) han de
+// col·lapsar en UNA entrada de catàleg; les versions es veuran com a opcions
+// de stream diferents en obrir-la. Deduplica per ID d'IMDB quan n'hi ha, i
+// si no, pel títol netejat.
+function dedupMetas(metas) {
+    const vistos = new Map();
+    for (const meta of metas) {
+        if (!meta) continue;
+        const clau = meta.id.startsWith("tt")
+            ? meta.id
+            : "nom:" + (cleanTitleForSearch(meta.name).queries[0] || meta.name).toLowerCase();
+        const previ = vistos.get(clau);
+        if (!previ) {
+            vistos.set(clau, meta);
+        } else if (!previ.poster && meta.poster) {
+            // Ens quedem amb la versió que sí que té caràtula
+            vistos.set(clau, meta);
+        }
+    }
+    return [...vistos.values()];
+}
+
 async function handleRequest(request) {
     try {
         const url = new URL(
@@ -1329,8 +1566,16 @@ async function handleRequest(request) {
         if (url.pathname === "/manifest.json") {
             const manifest = MANIFEST;
             manifest.catalogs = [];
+            // El recurs "stream" accepta IDs d'IMDB i Kitsu: així qualsevol
+            // sèrie/pel·lícula oberta des d'AIOMetadata (o qualsevol altre
+            // catàleg) ens demanarà streams, sense haver de passar pels
+            // nostres catàlegs.
             manifest.resources = [
-                { name: "stream", types: ["movie", "series", "anime"] },
+                {
+                    name: "stream",
+                    types: ["movie", "series", "anime"],
+                    idPrefixes: ["tt", "kitsu:", "gdrive:", "gdriveshow:"],
+                },
             ];
             if (CONFIG.enableSearchCatalog) {
                 manifest.catalogs.push({
@@ -1372,6 +1617,9 @@ async function handleRequest(request) {
                     name: "catalog",
                     types: ["movie", "series"],
                 });
+                // IMPORTANT: només reclamem "meta" pels nostres IDs interns.
+                // Les entrades amb ID d'IMDB les resol AIOMetadata, que és qui
+                // aporta descripció, logo, noms i imatges dels episodis.
                 manifest.resources.push({
                     name: "meta",
                     types: ["movie", "series"],
@@ -1487,7 +1735,8 @@ async function handleRequest(request) {
                     id: `gdrive:${ep.file.id}`,
                     season: ep.season,
                     episode: ep.episode,
-                    title: ep.title,
+                    title: titolEpisodiDeNom(ep.title, [folderInfo?.name])
+                        || `Episodi ${ep.episode}`,
                     released: ep.file.createdTime || undefined,
                 }));
                 console.log({
@@ -1558,15 +1807,20 @@ async function handleRequest(request) {
                         const subfolders = await listChildren(rootId, accessToken, {
                             onlyFolders: true,
                         });
-                        const folderMetas = await Promise.all(
-                            subfolders.map(async (folder) => {
-                                const tmdb = await getTmdbPosterByName(folder.name);
+                        const folderMetas = await processInBatches(
+                            subfolders,
+                            async (folder) => {
+                                // preferTv: aquestes carpetes SEMPRE són sèries,
+                                // així evitem que TMDB retorni la pel·lícula
+                                // homònima (causa habitual de caràtules errònies)
+                                const tmdb = await getTmdbPosterByName(folder.name, { preferTv: true });
                                 if (tmdb?.imdbId) {
                                     IMDB_TO_GDRIVE.set(tmdb.imdbId, { type: "series", id: folder.id });
                                     return {
                                         id: tmdb.imdbId,
                                         type: "series",
-                                        name: folder.name,
+                                        // Nom net: AIOMetadata el reemplaçarà pel títol oficial
+                                        name: tmdb.title || folder.name,
                                         posterShape: "poster",
                                         poster: tmdb.poster || null,
                                         background: tmdb.background || null,
@@ -1581,7 +1835,8 @@ async function handleRequest(request) {
                                     poster: tmdb?.poster || null,
                                     background: tmdb?.background || null,
                                 };
-                            })
+                            },
+                            5, 200
                         );
                         metas.push(...folderMetas);
                     }
@@ -1591,11 +1846,13 @@ async function handleRequest(request) {
                         error: error.toString(),
                     });
                 }
+                const metasFinals = dedupMetas(metas);
                 console.log({
                     message: "Collections catalog response",
-                    numMetas: metas.length,
+                    numCarpetes: metas.length,
+                    numMetas: metasFinals.length,
                 });
-                return createJsonResponse({ metas });
+                return createJsonResponse({ metas: metasFinals });
             }
 
             if (catalogId === "gdrive_list") {
@@ -1634,17 +1891,17 @@ async function handleRequest(request) {
                 }
 
                 const results = await fetchFiles(fetchUrl, accessToken);
-                const metas = await Promise.all(results.files.map((file) =>
-                    createMetaObject(
-                        file.id,
-                        file.name,
-                        file.size,
-                        file.thumbnailLink,
-                        file.createdTime
-                    )
-                ));
+                const totsMetas = await processInBatches(
+                    results.files,
+                    (file) => createMetaObject(
+                        file.id, file.name, file.size, file.thumbnailLink, file.createdTime
+                    ),
+                    5, 200
+                );
+                const metas = dedupMetas(totsMetas);
                 console.log({
                     message: "Catalog response",
+                    numFitxers: results.files.length,
                     numMetas: metas.length,
                 });
                 return createJsonResponse({ metas });
@@ -1681,15 +1938,14 @@ async function handleRequest(request) {
                     return createJsonResponse({ metas: [] });
                 }
 
-                const metas = await Promise.all(results.files.map((file) =>
-                    createMetaObject(
-                        file.id,
-                        file.name,
-                        file.size,
-                        file.thumbnailLink,
-                        file.createdTime
-                    )
-                ));
+                const totsMetas = await processInBatches(
+                    results.files,
+                    (file) => createMetaObject(
+                        file.id, file.name, file.size, file.thumbnailLink, file.createdTime
+                    ),
+                    5, 200
+                );
+                const metas = dedupMetas(totsMetas);
 
                 return createJsonResponse({ metas });
             }
@@ -1806,189 +2062,221 @@ async function createProxiedStreamResponse(fileId, filename, request) {
     }
 }
 
+// Recull tots els títols coneguts d'un IMDB ID (anglès, original, català,
+// castellà) per poder casar-los amb noms de carpeta en qualsevol idioma.
+async function getTitolsAlternatius(imdbId, type) {
+    if (TITLES_CACHE.has(imdbId)) return TITLES_CACHE.get(imdbId);
+
+    const titles = [];
+    const afegeix = (t) => {
+        if (t && !titles.some((x) => x.toLowerCase() === t.toLowerCase())) titles.push(t);
+    };
+
+    try {
+        const meta = await getCinemetaMeta(type, imdbId);
+        afegeix(meta?.name);
+    } catch (e) { /* ignore */ }
+
+    if (CONFIG.tmdbApiKey) {
+        const findUrl = API_ENDPOINTS.TMDB_FIND
+            .replace("{id}", imdbId)
+            .replace("{apiKey}", CONFIG.tmdbApiKey);
+        for (const lang of ["ca", "es", "en"]) {
+            try {
+                const res = await fetch(findUrl + `&language=${lang}`);
+                if (!res.ok) continue;
+                const data = await res.json();
+                const r = data.tv_results?.[0] || data.movie_results?.[0];
+                if (!r) continue;
+                afegeix(r.name || r.title);
+                afegeix(r.original_name || r.original_title);
+            } catch (e) { /* ignore */ }
+        }
+    }
+
+    TITLES_CACHE.set(imdbId, titles);
+    return titles;
+}
+
+function normalitzaTitol(t) {
+    return (t || "")
+        .toLowerCase()
+        .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+        .replace(/[^a-z0-9\s]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
 async function findCollectionFolder(imdbId, accessToken) {
-    // 1. Comprovar cache en memòria primer
     if (IMDB_TO_GDRIVE.has(imdbId)) {
         const mapping = IMDB_TO_GDRIVE.get(imdbId);
         if (mapping.type === "series") return mapping.id;
     }
 
-    // 2. Obtenir títols (anglès via Cinemeta + cerca TMDB per variants)
-    let titles = [];
-    try {
-        const meta = await getCinemetaMeta("series", imdbId);
-        if (meta?.name) titles.push(meta.name);
-    } catch (e) { /* ignore */ }
-
-    // Obtenir títol en català/castellà via TMDB
-    if (CONFIG.tmdbApiKey) {
-        try {
-            const tmdbMeta = await getTmdbMeta("series", imdbId);
-            if (tmdbMeta?.name && !titles.includes(tmdbMeta.name)) titles.push(tmdbMeta.name);
-        } catch (e) { /* ignore */ }
-
-        // Buscar títols alternatius en ca i es
-        const findUrl = API_ENDPOINTS.TMDB_FIND
-            .replace("{id}", imdbId)
-            .replace("{apiKey}", CONFIG.tmdbApiKey);
-        for (const lang of ["ca", "es"]) {
-            try {
-                const res = await fetch(findUrl + `&language=${lang}`);
-                if (res.ok) {
-                    const data = await res.json();
-                    const result = data.tv_results?.[0] || data.movie_results?.[0];
-                    if (result) {
-                        const name = result.name || result.title;
-                        if (name && !titles.includes(name)) titles.push(name);
-                    }
-                }
-            } catch (e) { /* ignore */ }
-        }
-    }
-
+    const titles = await getTitolsAlternatius(imdbId, "series");
     if (titles.length === 0) return null;
+    const titlesNorm = titles.map(normalitzaTitol).filter(Boolean);
 
-    // 3. Buscar la carpeta que coincideixi dins les collectionsRootFolderIds
+    let millor = null; // { id, score }
+
     for (const rootId of CONFIG.collectionsRootFolderIds) {
-        const subfolders = await listChildren(rootId, accessToken, { onlyFolders: true });
+        let subfolders;
+        try {
+            subfolders = await listChildren(rootId, accessToken, { onlyFolders: true });
+        } catch (e) { continue; }
+
         for (const folder of subfolders) {
-            const folderClean = cleanTitleForSearch(folder.name).queries[0]?.toLowerCase() || folder.name.toLowerCase();
-            for (const title of titles) {
-                const titleClean = title.toLowerCase();
-                if (folderClean.includes(titleClean) || titleClean.includes(folderClean)) {
-                    // Guardar al mapping per futures crides
-                    IMDB_TO_GDRIVE.set(imdbId, { type: "series", id: folder.id });
-                    console.log({ message: "Found collection folder", imdbId, folderName: folder.name, matchedTitle: title });
-                    return folder.id;
+            const netejat = cleanTitleForSearch(folder.name).queries[0] || folder.name;
+            const folderNorm = normalitzaTitol(netejat);
+            if (!folderNorm) continue;
+
+            for (const t of titlesNorm) {
+                let score = 0;
+                if (folderNorm === t) score = 3;
+                else if (folderNorm.startsWith(t) || t.startsWith(folderNorm)) score = 2;
+                else if (folderNorm.includes(t) || t.includes(folderNorm)) score = 1;
+                if (score > 0 && (!millor || score > millor.score)) {
+                    millor = { id: folder.id, nom: folder.name, score };
                 }
             }
         }
     }
+
+    if (millor) {
+        IMDB_TO_GDRIVE.set(imdbId, { type: "series", id: millor.id });
+        console.log({ message: "Collection folder trobada", imdbId, carpeta: millor.nom, score: millor.score });
+        return millor.id;
+    }
     return null;
 }
 
-async function findMovieFile(imdbId, accessToken) {
-    // 1. Comprovar cache en memòria primer
-    if (IMDB_TO_GDRIVE.has(imdbId)) {
-        const mapping = IMDB_TO_GDRIVE.get(imdbId);
-        if (mapping.type === "movie") return mapping.id;
-    }
+async function findMovieFiles(imdbId, accessToken) {
+    const titles = await getTitolsAlternatius(imdbId, "movie");
+    if (titles.length === 0) return [];
 
-    // 2. Obtenir títols
-    let titles = [];
-    try {
-        const meta = await getCinemetaMeta("movie", imdbId);
-        if (meta?.name) titles.push(meta.name);
-    } catch (e) { /* ignore */ }
+    const movieFolderIds = CONFIG.moviesFolderIds?.length > 0
+        ? CONFIG.moviesFolderIds
+        : CONFIG.driveFolderIds;
+    if (!movieFolderIds?.length) return [];
 
-    if (CONFIG.tmdbApiKey) {
-        try {
-            const tmdbMeta = await getTmdbMeta("movie", imdbId);
-            if (tmdbMeta?.name && !titles.includes(tmdbMeta.name)) titles.push(tmdbMeta.name);
-        } catch (e) { /* ignore */ }
-
-        const findUrl = API_ENDPOINTS.TMDB_FIND
-            .replace("{id}", imdbId)
-            .replace("{apiKey}", CONFIG.tmdbApiKey);
-        for (const lang of ["ca", "es"]) {
-            try {
-                const res = await fetch(findUrl + `&language=${lang}`);
-                if (res.ok) {
-                    const data = await res.json();
-                    const result = data.movie_results?.[0];
-                    if (result) {
-                        const name = result.title || result.name;
-                        if (name && !titles.includes(name)) titles.push(name);
-                    }
-                }
-            } catch (e) { /* ignore */ }
-        }
-    }
-
-    if (titles.length === 0) return null;
-
-    // 3. Buscar el fitxer dins moviesFolderIds
-    const movieFolderIds = CONFIG.moviesFolderIds?.length > 0 ? CONFIG.moviesFolderIds : CONFIG.driveFolderIds;
-    if (!movieFolderIds?.length) return null;
+    const trobats = new Map(); // fileId → file
 
     for (const folderId of movieFolderIds) {
         for (const title of titles) {
-            const q = `'${folderId}' in parents and trashed=false and mimeType contains 'video/' and name contains '${title.replace(/'/g, "\\\\'")}'`;
+            const q = `'${folderId}' in parents and trashed=false and mimeType contains 'video/' `
+                + `and name contains '${title.replace(/'/g, "\\'")}' `
+                + `and not name contains 'trailer' and not name contains 'sample'`;
             const fetchUrl = new URL(API_ENDPOINTS.DRIVE_FETCH_FILES);
             fetchUrl.search = new URLSearchParams({
-                q, corpora: "allDrives", includeItemsFromAllDrives: "true",
-                supportsAllDrives: "true", pageSize: "10",
+                q,
+                corpora: "allDrives",
+                includeItemsFromAllDrives: "true",
+                supportsAllDrives: "true",
+                pageSize: "50",
                 fields: "files(id,name,size,videoMediaMetadata,mimeType,fileExtension)",
             }).toString();
             try {
                 const results = await fetchFiles(fetchUrl, accessToken);
-                if (results?.files?.length > 0) {
-                    const fileId = results.files[0].id;
-                    IMDB_TO_GDRIVE.set(imdbId, { type: "movie", id: fileId });
-                    console.log({ message: "Found movie file", imdbId, fileName: results.files[0].name, matchedTitle: title });
-                    return fileId;
+                for (const f of results?.files || []) {
+                    if (!trobats.has(f.id)) trobats.set(f.id, f);
                 }
             } catch (e) { /* ignore */ }
         }
+        if (trobats.size > 0) break;
     }
-    return null;
+
+    const files = [...trobats.values()];
+    if (files.length > 0) {
+        console.log({ message: "Fitxers de pel·lícula trobats", imdbId, count: files.length });
+    }
+    return files;
 }
 
 async function getStreams(streamRequest) {
     const streams = [];
     const imdbId = streamRequest.id.split(":")[0];
+    const esImdb = imdbId.startsWith("tt");
 
-    // SÈRIES: buscar carpeta de la col·lecció i caminar-la
-    if (streamRequest.season && streamRequest.episode) {
+    // ── SÈRIES ────────────────────────────────────────────────────────────
+    if (esImdb && streamRequest.season && streamRequest.episode) {
         try {
             const accessToken = await getAccessToken();
             if (accessToken) {
                 const folderId = await findCollectionFolder(imdbId, accessToken);
                 if (folderId) {
-                    const fitxersRuta = await walkCollectionFiles(folderId, accessToken);
-                    const episodis = assignaEpisodis(fitxersRuta);
                     const targetSeason = parseInt(streamRequest.season, 10);
                     const targetEpisode = parseInt(streamRequest.episode, 10);
-                    const matches = episodis.filter(
-                        (ep) => ep.season === targetSeason && ep.episode === targetEpisode
+
+                    const [fitxersRuta, structure] = await Promise.all([
+                        walkCollectionFiles(folderId, accessToken),
+                        getSeasonStructure(imdbId),
+                    ]);
+
+                    const { matches, estrategia } = trobaEpisodis(
+                        fitxersRuta, targetSeason, targetEpisode, structure
                     );
-                    for (const match of matches) {
-                        const file = match.file;
-                        const parsedFile = parseFile(file);
-                        const stream = createStream(parsedFile, accessToken);
-                        if (stream) streams.push(stream);
-                    }
-                    if (streams.length > 0) {
-                        console.log({ message: "Found streams via collection folder", imdbId, season: targetSeason, episode: targetEpisode, count: streams.length });
+
+                    if (matches.length > 0) {
+                        // Cada fitxer coincident és una OPCIÓ DE QUALITAT del
+                        // mateix episodi, no un episodi diferent.
+                        const titolsSerie = await getTitolsAlternatius(imdbId, "series");
+                        const titolPerId = new Map();
+                        const parsedFiles = matches.map((m) => {
+                            const pf = parseFile(m.file);
+                            titolPerId.set(pf.id, titolEpisodiDeNom(m.nomArxiu, titolsSerie));
+                            return pf;
+                        });
+                        // Ordena les opcions per resolució/qualitat/idioma
+                        sortParsedFiles(parsedFiles);
+
+                        for (const pf of parsedFiles) {
+                            const titol = titolPerId.get(pf.id);
+                            const stream = createStream(pf, accessToken, {
+                                season: targetSeason,
+                                episode: targetEpisode,
+                                title: titol,
+                            });
+                            if (stream) streams.push(stream);
+                        }
+                        console.log({
+                            message: "Streams trobats (col·lecció)",
+                            imdbId, targetSeason, targetEpisode,
+                            estrategia, count: streams.length,
+                        });
                         return streams;
                     }
+                    console.log({
+                        message: "Cap episodi coincident a la col·lecció",
+                        imdbId, targetSeason, targetEpisode,
+                        fitxersTotals: fitxersRuta.length,
+                        teEstructura: !!structure,
+                    });
                 }
             }
         } catch (e) {
-            console.error({ message: "Error in collection stream lookup", error: e.toString() });
+            console.error({ message: "Error cercant streams de sèrie", error: e.toString() });
         }
     }
 
-    // PEL·LÍCULES: buscar fitxer directe
-    if (!streamRequest.season && !streamRequest.episode) {
+    // ── PEL·LÍCULES ───────────────────────────────────────────────────────
+    if (esImdb && !streamRequest.season && !streamRequest.episode) {
         try {
             const accessToken = await getAccessToken();
             if (accessToken) {
-                const fileId = await findMovieFile(imdbId, accessToken);
-                if (fileId) {
-                    const file = await fetchFile(fileId, accessToken);
-                    if (file) {
-                        const parsedFile = parseFile(file);
-                        const stream = createStream(parsedFile, accessToken);
-                        if (stream) {
-                            console.log({ message: "Found stream via movie lookup", imdbId, fileId });
-                            return [stream];
-                        }
+                const files = await findMovieFiles(imdbId, accessToken);
+                if (files.length > 0) {
+                    const parsedFiles = files.map(parseFile);
+                    sortParsedFiles(parsedFiles);
+                    for (const pf of parsedFiles) {
+                        const stream = createStream(pf, accessToken);
+                        if (stream) streams.push(stream);
                     }
+                    console.log({ message: "Streams trobats (pel·lícula)", imdbId, count: streams.length });
+                    return streams;
                 }
             }
         } catch (e) {
-            console.error({ message: "Error in movie stream lookup", error: e.toString() });
+            console.error({ message: "Error cercant streams de pel·lícula", error: e.toString() });
         }
     }
 
