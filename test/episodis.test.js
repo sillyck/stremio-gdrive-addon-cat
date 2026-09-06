@@ -102,6 +102,26 @@ prova(`"S01×E28" no apareix al títol`,
 prova(`"T1xC11 El justificant" → "El justificant"`,
   titolEpisodiDeNom("T1xC11 El justificant.mkv",["Fanboy"])==="El justificant");
 
+console.log("\n── Sèrie llarga de moltes temporades amb numeració absoluta");
+// Cas real vist als logs: peticions tipus tt0131179:30:1 i :34:1.
+// Temporades de mides desiguals, fitxers numerats de l'1 al 992.
+{
+  const eps=[26,29,29,28,29,29,32,30,29,28,31,29,28,30,29,30,29,29,30,28,
+             29,30,28,29,30,29,28,30,29,31,30,29,28,30];
+  const estructura=[undefined,...eps];
+  const n=eps.reduce((a,b)=>a+b,0);
+  const fitxers=Array.from({length:n},(_,i)=>f([`Serie - ${String(i+1).padStart(4,'0')} - Cap.mkv`]));
+  let bons=0, massa=0;
+  for(let s=1;s<=eps.length;s++) for(let e=1;e<=eps[s-1];e++){
+    let abs=0; for(let i=1;i<s;i++) abs+=eps[i-1]; abs+=e;
+    const r=trobaEpisodis(fitxers,s,e,estructura);
+    if(r.matches.length>1) massa++;
+    if(r.matches.length===1 && r.matches[0].nomArxiu.includes(`- ${String(abs).padStart(4,'0')} -`)) bons++;
+  }
+  prova(`els ${n} episodis de ${eps.length} temporades es resolen bé`, bons===n);
+  prova(`cap petició retorna episodis de sobra`, massa===0);
+}
+
 console.log("\n"+"═".repeat(72));
 console.log(fall===0 ? `TOTES LES ${total} PROVES PASSEN` : `${fall} de ${total} PROVES FALLEN`);
 process.exit(fall?1:0);
