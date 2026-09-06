@@ -149,6 +149,18 @@ console.log("\n── Fitxers que no són episodis (openings, OVAs, pel·lícule
   prova(`${dins.length} episodis reals es mantenen`, dins.every((n) => !noEp(n)));
 }
 
+console.log("\n── Filtre d'extres amb les carpetes reals de Bola de Drac");
+{
+  const ex = ctx.esCarpetaDExtres;
+  const fora = ["OSTs","Subtitols per Versio Albert Wesker","Scans","Extres",
+                "Dragonball Z Complete Song Collection Box [FLAC]",
+                "Dragon Ball - Music Collection [FLAC]"];
+  const dins = ["Bola de Drac Z [cat jap] [Albert Wesker]","Multi-Audio+Subs",
+                "DRAGONBALL Zenkyoku Shu","Temporada 1"];
+  prova(`${fora.length} carpetes d'extres reals s'ometen`, fora.every(ex));
+  prova(`${dins.length} carpetes d'episodis reals es recorren`, dins.every((n) => !ex(n)));
+}
+
 console.log("\n"+"═".repeat(72));
 console.log(fall===0 ? `TOTES LES ${total} PROVES PASSEN` : `${fall} de ${total} PROVES FALLEN`);
 process.exit(fall?1:0);

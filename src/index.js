@@ -81,7 +81,7 @@ const CONFIG = {
 
 // Identificador de la versió del codi. Serveix per verificar via /versio
 // quina versió s'està executant realment al worker.
-const VERSIO_CODI = "2026-09-06.sense-cau-recorregut";
+const VERSIO_CODI = "2026-09-06.franquicies+extres-v2";
 
 const MANIFEST = {
     id: "stremio.gdrive.worker.cat",
@@ -1793,10 +1793,13 @@ function esFitxerNoEpisodi(nom) {
 
 function esCarpetaDExtres(nom) {
     if (CARPETES_NO_EPISODIS.test(nom)) return true;
-    // Comença per la paraula: "Extres i coses", "Music Collection"…
-    if (/^\s*(?:extres?|extras?|m[úu]sica?|music|ost|ova|oav|ona|nc)\b[\s&_-]/i.test(nom)) return true;
-    // Acaba en OST: "Series OST", "Movies OST"
-    if (/\bost\s*$/i.test(nom)) return true;
+    // Comença per la paraula: "Extres i coses", "OSTs", "Subtitols per…"
+    if (/^\s*(?:extres?|extras?|m[úu]sica?|music|osts?|ova|oav|ona|nc|scans?|artbooks?)\b/i.test(nom)) return true;
+    if (/^\s*(?:subt[íi]tols?|subs|subtitles?)\b/i.test(nom)) return true;
+    // Acaba en OST / OSTs: "Series OST", "Movies OSTs"
+    if (/\bosts?\s*$/i.test(nom)) return true;
+    // Col·leccions musicals: "… Music Collection [FLAC]", "… Song Collection Box"
+    if (/\b(?:music|song|bgm|theme)\b.*\bcollection\b/i.test(nom)) return true;
     return false;
 }
 
@@ -1843,6 +1846,39 @@ async function desaRecorregutAlCau(folderId, fitxers) {
         if (globalThis.__ctx?.waitUntil) globalThis.__ctx.waitUntil(promesa);
         else await promesa;
     } catch (e) { /* el cau és una optimització, no una dependència */ }
+}
+
+// Algunes carpetes no són una sèrie sinó un contenidor de FRANQUÍCIA. Per
+// exemple "Bola de Drac" conté "Bola de Drac", "Bola de Drac Z" i "Bola de
+// Drac GT". Recórrer-la sencera barreja els episodis de les tres sèries.
+// Si alguna subcarpeta coincideix EXACTAMENT amb el títol que busquem,
+// baixem només per aquella i deixem estar la resta.
+async function afinaCarpetaDeSerie(rootFolderId, titols, accessToken) {
+    if (!titols?.length || !quedaPressupost(6)) return rootFolderId;
+    let subcarpetes;
+    try {
+        subcarpetes = await listChildren(rootFolderId, accessToken, { onlyFolders: true });
+    } catch (e) {
+        return rootFolderId;
+    }
+    if (subcarpetes.length < 2) return rootFolderId;
+
+    const titolsNorm = titols.map(normalitzaTitol).filter(Boolean);
+    const exactes = [];
+    for (const sub of subcarpetes) {
+        if (esCarpetaDExtres(sub.name)) continue;
+        const net = cleanTitleForSearch(sub.name).queries[0] || sub.name;
+        if (titolsNorm.includes(normalitzaTitol(net))) exactes.push(sub);
+    }
+
+    if (exactes.length === 1) {
+        console.log({
+            message: "Contenidor de franquícia: baixo a la subcarpeta exacta",
+            arrel: rootFolderId, subcarpeta: exactes[0].name,
+        });
+        return exactes[0].id;
+    }
+    return rootFolderId;
 }
 
 async function walkCollectionFiles(rootFolderId, accessToken, maxDepth = 6) {
@@ -3255,8 +3291,10 @@ async function getStreams(streamRequest) {
 
                 // Provem cada carpeta candidata fins que alguna contingui
                 // l'episodi. Amb una sola carpeta el comportament és el mateix.
-                for (const folderId of carpetes) {
+                const titolsSerie = await getTitolsAlternatius(imdbId, "series");
+                for (const folderIdBrut of carpetes) {
                     if (!quedaPressupost(6)) break;
+                    const folderId = await afinaCarpetaDeSerie(folderIdBrut, titolsSerie, accessToken);
                     const fitxersRuta = await walkCollectionFiles(folderId, accessToken);
                     const { matches, estrategia } = trobaEpisodis(
                         fitxersRuta, targetSeason, targetEpisode, structure
@@ -3265,7 +3303,6 @@ async function getStreams(streamRequest) {
                     if (matches.length > 0) {
                         // Cada fitxer coincident és una OPCIÓ DE QUALITAT del
                         // mateix episodi, no un episodi diferent.
-                        const titolsSerie = await getTitolsAlternatius(imdbId, "series");
                         const titolPerId = new Map();
                         const parsedFiles = matches.map((m) => {
                             const pf = parseFile(m.file);
@@ -3289,6 +3326,16 @@ async function getStreams(streamRequest) {
                             imdbId, targetSeason, targetEpisode,
                             estrategia, count: streams.length,
                         });
+                        // Un episodi hauria de tenir poques versions. Si en
+                        // surten moltes, la numeració no és fiable: registrem
+                        // les rutes per veure d'on surten.
+                        if (matches.length > 4) {
+                            console.log({
+                                message: "ATENCIÓ: massa resultats per un sol episodi",
+                                imdbId, targetSeason, targetEpisode, quants: matches.length,
+                                rutes: matches.slice(0, 15).map((m) => m.ruta.join("/")),
+                            });
+                        }
                         return streams;
                     }
                     console.log({
