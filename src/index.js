@@ -41,7 +41,9 @@ const CONFIG = {
     // petició i les desem en un mapa persistent. Al cap de 3-4 refrescs el
     // catàleg queda complet i, a partir d'aquí, carrega instantàniament.
     // Si passes al pla de pagament (10.000 subpeticions) pots pujar-ho molt.
-    maxResolucionsPerPeticio: 12,
+    // Cada títol pot costar fins a 6 subpeticions (TMDB x3 + Viquipèdia x2).
+    // Amb un pressupost de 46 en caben ~7 per invocació.
+    maxResolucionsPerPeticio: 7,
     // Durada del mapa a la memòria cau (segons). 7 dies.
     mapaTtlSegons: 604800,
     driveQueryTerms: {
@@ -870,6 +872,79 @@ function cleanTitleForSearch(name) {
     return { queries, year };
 }
 
+// ── Resolució de títols en català ─────────────────────────────────────────
+// TMDB cerca per títol original, traduccions i títols alternatius, però les
+// traduccions CATALANES sovint no hi són. Per això, quan TMDB falla, anem a
+// la Viquipèdia catalana: els seus articles estan enllaçats a Wikidata, que
+// guarda l'ID d'IMDb a la propietat P345. Així obtenim l'ID d'IMDb a partir
+// del títol català, i amb això AIOMetadata ja pot aportar tota la metadata.
+async function imdbDesDeViquipedia(titol, any) {
+    if (!quedaPressupost(4)) return null;
+    try {
+        const cerca = any ? `${titol} ${any}` : titol;
+        const params = new URLSearchParams({
+            action: "query",
+            format: "json",
+            formatversion: "2",
+            generator: "search",
+            gsrsearch: cerca,
+            gsrlimit: "3",
+            gsrnamespace: "0",
+            prop: "pageprops",
+            ppprop: "wikibase_item",
+        });
+
+        if (!consumeix(1)) return null;
+        const res = await fetch(`https://ca.wikipedia.org/w/api.php?${params}`, {
+            headers: { "User-Agent": "stremio-gdrive-addon-cat/1.0" },
+        });
+        if (!res.ok) return null;
+        const data = await res.json();
+        const pagines = data?.query?.pages || [];
+
+        const qids = pagines
+            .map((pg) => pg?.pageprops?.wikibase_item)
+            .filter(Boolean)
+            .slice(0, 3);
+        if (qids.length === 0) return null;
+
+        // Una sola crida per a tots els candidats
+        if (!consumeix(1)) return null;
+        const wdParams = new URLSearchParams({
+            action: "wbgetentities",
+            ids: qids.join("|"),
+            props: "claims|labels",
+            languages: "ca|es|en",
+            format: "json",
+        });
+        const wdRes = await fetch(`https://www.wikidata.org/w/api.php?${wdParams}`, {
+            headers: { "User-Agent": "stremio-gdrive-addon-cat/1.0" },
+        });
+        if (!wdRes.ok) return null;
+        const wdData = await wdRes.json();
+
+        for (const qid of qids) {
+            const ent = wdData?.entities?.[qid];
+            const imdb = ent?.claims?.P345?.[0]?.mainsnak?.datavalue?.value;
+            if (typeof imdb === "string" && /^tt\d+$/.test(imdb)) {
+                const label = ent?.labels?.en?.value || ent?.labels?.ca?.value || null;
+                console.log({ message: "IMDb via Viquipèdia", titol, imdb, label });
+                return { imdbId: imdb, title: label };
+            }
+        }
+        return null;
+    } catch (e) {
+        console.error({ message: "Viquipèdia ha fallat", titol, error: e.toString() });
+        return null;
+    }
+}
+
+// Treu accents i diacrítics: "Anastàsia" → "Anastasia", que sovint ja casa
+// directament amb el títol anglès o castellà que TMDB sí que té indexat.
+function senseAccents(t) {
+    return (t || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+}
+
 async function getTmdbPosterByName(name, { preferTv = false } = {}) {
     if (!CONFIG.tmdbApiKey) return null;
 
@@ -902,41 +977,73 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
         // idioma. Això baixa de ~16 subpeticions per títol a 2, que és el que
         // fa que el catàleg càpiga dins dels límits del pla gratuït.
         const endpoint = preferTv ? "tv" : "multi";
-        const q = queries[0];
 
-        const params = new URLSearchParams({
-            api_key: CONFIG.tmdbApiKey,
-            query: q,
-            page: "1",
-            include_adult: "false",
-            language: "ca-ES",
-        });
-        if (year) params.set(endpoint === "tv" ? "first_air_date_year" : "year", year);
+        async function cercaTmdb(q) {
+            const params = new URLSearchParams({
+                api_key: CONFIG.tmdbApiKey,
+                query: q,
+                page: "1",
+                include_adult: "false",
+                language: "ca-ES",
+            });
+            if (year) params.set(endpoint === "tv" ? "first_air_date_year" : "year", year);
+            if (!consumeix(1)) return null;
+            const res = await fetch(`https://api.themoviedb.org/3/search/${endpoint}?${params}`);
+            if (!res.ok) return null;
+            const data = await res.json();
+            const results = data.results || [];
 
-        if (!consumeix(1)) return null;
-        const res = await fetch(`https://api.themoviedb.org/3/search/${endpoint}?${params}`);
-        if (!res.ok) {
-            TMDB_CACHE.set(cacheKey, null);
-            return null;
+            let m = null;
+            for (const r of results.slice(0, 6)) {
+                const mt = r.media_type || (endpoint === "tv" ? "tv" : "movie");
+                if (preferTv && mt === "movie") continue;
+                const score = puntua(r, q);
+                if (score === 0) continue;
+                if (!m || score > m.score) m = { result: { ...r, media_type: mt }, score };
+                if (score === 3) break;
+            }
+            return m;
         }
-        const data = await res.json();
-        const results = data.results || [];
 
-        let millor = null;
-        for (const r of results.slice(0, 6)) {
-            const mt = r.media_type || (endpoint === "tv" ? "tv" : "movie");
-            if (preferTv && mt === "movie") continue;
-            const score = puntua(r, q);
-            if (score === 0) continue;
-            if (!millor || score > millor.score) millor = { result: { ...r, media_type: mt }, score };
-            if (score === 3) break;
+        // NIVELL 1: el títol tal com surt al fitxer/carpeta
+        let millor = await cercaTmdb(queries[0]);
+
+        // NIVELL 2: sense accents. "Anastàsia" → "Anastasia" casa directament
+        // amb el títol que TMDB té indexat en molts casos.
+        if ((!millor || millor.score < 2) && quedaPressupost(5)) {
+            const sa = senseAccents(queries[0]);
+            if (sa !== queries[0]) {
+                const alt = await cercaTmdb(sa);
+                if (alt && (!millor || alt.score > millor.score)) millor = alt;
+            }
         }
-        // Si res no puntua però hi ha un únic resultat clar, l'acceptem
-        if (!millor && results.length > 0) {
-            const r = results[0];
-            const mt = r.media_type || (endpoint === "tv" ? "tv" : "movie");
-            if (!(preferTv && mt === "movie")) millor = { result: { ...r, media_type: mt }, score: 0 };
+
+        // NIVELL 2b: la segona consulta (títol original entre parèntesis)
+        if ((!millor || millor.score < 2) && queries[1] && quedaPressupost(5)) {
+            const alt = await cercaTmdb(queries[1]);
+            if (alt && (!millor || alt.score > millor.score)) millor = alt;
         }
+
+        // NIVELL 3: Viquipèdia catalana → Wikidata → IMDb. És l'únic camí
+        // fiable per als títols catalans que TMDB no té traduïts.
+        if ((!millor || millor.score < 2) && quedaPressupost(5)) {
+            const viqui = await imdbDesDeViquipedia(queries[0], year);
+            if (viqui?.imdbId) {
+                const out = {
+                    poster: `https://btttr.cc/poster-n/imdb/poster-default/${viqui.imdbId}.jpg`,
+                    background: null,
+                    imdbId: viqui.imdbId,
+                    tmdbId: null,
+                    tmdbType: preferTv ? "tv" : "movie",
+                    title: viqui.title,
+                    score: 2,
+                    font: "viquipedia",
+                };
+                TMDB_CACHE.set(cacheKey, out);
+                return out;
+            }
+        }
+
         if (!millor) {
             TMDB_CACHE.set(cacheKey, null);
             return null;
@@ -1719,34 +1826,102 @@ async function handleRequest(request) {
             if (!accessToken) return createJsonResponse({ error: "Credencials invàlides" }, 500);
             await carregaMapa();
 
-            let resoltes = 0, pendents = 0, total = 0;
+            let resoltes = 0, totalSeries = 0, totalPelis = 0, pendents = 0;
 
+            // ── Sèries ────────────────────────────────────────────────────
             for (const rootId of CONFIG.collectionsRootFolderIds) {
                 let carpetes = [];
                 try { carpetes = await listChildren(rootId, accessToken, { onlyFolders: true }); }
                 catch (e) { continue; }
-                total += carpetes.length;
+                totalSeries += carpetes.length;
                 for (const folder of carpetes) {
                     if (llegeixMapa("s:" + folder.id)) continue;
-                    if (!quedaPressupost(6)) { pendents++; continue; }
-                    const tmdb = await getTmdbPosterByName(folder.name, { preferTv: true });
-                    escriuMapa("s:" + folder.id, tmdb
-                        ? { imdbId: tmdb.imdbId, poster: tmdb.poster, background: tmdb.background, title: tmdb.title }
+                    if (!quedaPressupost(8)) { pendents++; continue; }
+                    const r = await getTmdbPosterByName(folder.name, { preferTv: true });
+                    escriuMapa("s:" + folder.id, r
+                        ? { imdbId: r.imdbId, poster: r.poster, background: r.background, title: r.title }
                         : { imdbId: null, poster: null, background: null, title: null });
                     resoltes++;
                 }
             }
 
-            await desaMapa(null);   // aquí sí que esperem l'escriptura
-            const jaAlMapa = Object.keys(MAPA || {}).length;
+            // ── Pel·lícules ───────────────────────────────────────────────
+            const carpetesPelis = CONFIG.moviesFolderIds?.length
+                ? CONFIG.moviesFolderIds : CONFIG.driveFolderIds;
+            for (const folderId of carpetesPelis || []) {
+                if (!quedaPressupost(8)) break;
+                let fitxers = [];
+                try {
+                    fitxers = await listChildren(folderId, accessToken, { onlyFiles: true });
+                } catch (e) { continue; }
+                const videos = fitxers.filter((f) => VIDEO_EXT_REGEX.test(f.name));
+                totalPelis += videos.length;
+                for (const file of videos) {
+                    if (llegeixMapa("m:" + file.id)) continue;
+                    if (!quedaPressupost(8)) { pendents++; continue; }
+                    const r = await getTmdbPosterByName(file.name);
+                    escriuMapa("m:" + file.id, r
+                        ? { imdbId: r.imdbId, poster: r.poster, background: r.background, title: r.title }
+                        : { imdbId: null, poster: null, background: null, title: null });
+                    resoltes++;
+                }
+            }
+
+            await desaMapa(null);
+
+            const alMapa = Object.keys(MAPA || {}).length;
+            const total = totalSeries + totalPelis;
+            const restants = Math.max(0, total - alMapa);
+            const acabat = restants === 0 && pendents === 0;
+
+            // Des del navegador retornem una pàgina que es refresca sola: així
+            // n'hi ha prou d'obrir-la una vegada i deixar-la treballar, en
+            // comptes d'haver de recarregar a mà desenes de vegades.
+            const acceptaHtml = (request.headers.get("Accept") || "").includes("text/html");
+            if (acceptaHtml) {
+                const pct = total > 0 ? Math.round((alMapa / total) * 100) : 100;
+                const html = `<!DOCTYPE html><html lang="ca"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+${acabat ? "" : '<meta http-equiv="refresh" content="2">'}
+<title>Omplint el catàleg</title>
+<style>
+ body{font-family:system-ui,-apple-system,sans-serif;background:#111;color:#eee;
+      margin:0;padding:2rem;display:flex;min-height:100vh;align-items:center;justify-content:center}
+ .c{max-width:32rem;width:100%}
+ h1{font-size:1.25rem;margin:0 0 1.5rem}
+ .bar{background:#333;border-radius:99px;height:1.5rem;overflow:hidden;margin:1rem 0}
+ .fill{background:${acabat ? "#4ade80" : "#60a5fa"};height:100%;width:${pct}%;transition:width .4s}
+ table{width:100%;border-collapse:collapse;margin-top:1.5rem;font-size:.9rem}
+ td{padding:.4rem 0;border-bottom:1px solid #262626}
+ td:last-child{text-align:right;color:#a3a3a3}
+ .ok{color:#4ade80;font-weight:600}
+</style></head><body><div class="c">
+<h1>${acabat ? '<span class="ok">Catàleg complet</span>' : "Resolent metadades…"}</h1>
+<div class="bar"><div class="fill"></div></div>
+<table>
+ <tr><td>Progrés</td><td>${alMapa} / ${total} (${pct}%)</td></tr>
+ <tr><td>Sèries</td><td>${totalSeries}</td></tr>
+ <tr><td>Pel·lícules</td><td>${totalPelis}</td></tr>
+ <tr><td>Resoltes en aquesta passada</td><td>${resoltes}</td></tr>
+ <tr><td>Pressupost restant</td><td>${PRESSUPOST}</td></tr>
+</table>
+<p style="color:#a3a3a3;font-size:.85rem;margin-top:1.5rem">
+${acabat
+  ? "Ja pots tancar aquesta pàgina i obrir Stremio."
+  : "Deixa la pàgina oberta: es refresca sola cada 2 segons fins acabar."}
+</p></div></body></html>`;
+                return new Response(html, {
+                    headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+                });
+            }
+
             return createJsonResponse({
-                missatge: pendents > 0
-                    ? "Encara queden títols per resoldre. Torna a carregar /omplir."
-                    : "Mapa complet.",
-                totalCarpetes: total,
+                acabat,
+                totalSeries,
+                totalPelis,
+                entradesAlMapa: alMapa,
                 resoltesAquestaVegada: resoltes,
-                pendents,
-                entradesAlMapa: jaAlMapa,
+                pressupostRestant: PRESSUPOST,
             });
         }
 
