@@ -153,6 +153,38 @@ async function desaMapa(ctx) {
     }
 }
 
+// Índex invers imdbId → { tipus, id }. Es construeix a partir del mapa
+// persistent, que és el que /omplir ha anat omplint. Sense això, una petició
+// d'streams que arriba des d'AIOMetadata no té manera de saber quina carpeta
+// o fitxer del Drive correspon a aquell IMDb ID, i acaba en "No streams found".
+let INDEX_INVERS = null;
+
+function construeixIndexInvers() {
+    INDEX_INVERS = new Map();
+    if (!MAPA) return INDEX_INVERS;
+    for (const [clau, valor] of Object.entries(MAPA)) {
+        if (!valor?.imdbId) continue;
+        const tipus = clau.startsWith("s:") ? "series" : "movie";
+        const id = clau.slice(2);
+        const existent = INDEX_INVERS.get(valor.imdbId);
+        if (!existent) {
+            INDEX_INVERS.set(valor.imdbId, { tipus, ids: [id] });
+        } else if (existent.tipus === tipus) {
+            // Diverses còpies del mateix títol (qualitats diferents)
+            existent.ids.push(id);
+        }
+    }
+    return INDEX_INVERS;
+}
+
+async function buscaAlMapa(imdbId) {
+    if (!INDEX_INVERS) {
+        await carregaMapa();
+        construeixIndexInvers();
+    }
+    return INDEX_INVERS.get(imdbId) || null;
+}
+
 function llegeixMapa(clau) {
     return MAPA?.[clau] || null;
 }
@@ -161,6 +193,7 @@ function escriuMapa(clau, valor) {
     if (!MAPA) MAPA = {};
     MAPA[clau] = { ...valor, ts: Date.now() };
     MAPA_BRUT = true;
+    INDEX_INVERS = null;   // s'ha de reconstruir
 }
 
 // Limitar concurrència per no superar rate limits de TMDB (~40 req/10s)
@@ -991,6 +1024,131 @@ function senseAccents(t) {
 // identificador, no per text, així que sempre encerta si TMDB coneix l'obra.
 // URL de la caràtula generada pel propi worker, per garantir que cap entrada
 // del catàleg es quedi sense imatge.
+// ── PNG mínim generat a mà ────────────────────────────────────────────────
+// Escrivim un PNG vàlid sense cap llibreria: capçalera, IHDR, IDAT amb blocs
+// deflate "stored" (sense compressió, que és legal i molt simple) i IEND.
+const CRC_TAULA = (() => {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+        t[n] = c >>> 0;
+    }
+    return t;
+})();
+
+function crc32(bytes) {
+    let c = 0xffffffff;
+    for (let i = 0; i < bytes.length; i++) c = CRC_TAULA[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+}
+
+function adler32(bytes) {
+    let a = 1, b = 0;
+    for (let i = 0; i < bytes.length; i++) {
+        a = (a + bytes[i]) % 65521;
+        b = (b + a) % 65521;
+    }
+    return ((b << 16) | a) >>> 0;
+}
+
+function u32(n) {
+    return new Uint8Array([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
+}
+
+function troç(tipus, dades) {
+    const nom = new TextEncoder().encode(tipus);
+    const cos = new Uint8Array(nom.length + dades.length);
+    cos.set(nom, 0);
+    cos.set(dades, nom.length);
+    const out = new Uint8Array(4 + cos.length + 4);
+    out.set(u32(dades.length), 0);
+    out.set(cos, 4);
+    out.set(u32(crc32(cos)), 4 + cos.length);
+    return out;
+}
+
+function hslARgb(h, s, l) {
+    s /= 100; l /= 100;
+    const c = (1 - Math.abs(2 * l - 1)) * s;
+    const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+    const m = l - c / 2;
+    let r = 0, g = 0, b = 0;
+    if (h < 60) [r, g, b] = [c, x, 0];
+    else if (h < 120) [r, g, b] = [x, c, 0];
+    else if (h < 180) [r, g, b] = [0, c, x];
+    else if (h < 240) [r, g, b] = [0, x, c];
+    else if (h < 300) [r, g, b] = [x, 0, c];
+    else [r, g, b] = [c, 0, x];
+    return [
+        Math.round((r + m) * 255),
+        Math.round((g + m) * 255),
+        Math.round((b + m) * 255),
+    ];
+}
+
+function pngDegradat(titol) {
+    // Mida petita: Stremio recomana caràtules per sota de 100 kB i l'escala
+    // ell mateix. 60×90 manté la proporció 1:0.675 i pesa molt poc.
+    const W = 60, H = 90;
+    const to = [...titol].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7) % 360;
+    const dalt = hslARgb(to, 45, 34);
+    const baix = hslARgb((to + 40) % 360, 50, 15);
+
+    // Píxels en cru: cada fila comença amb el byte de filtre (0 = cap)
+    const cru = new Uint8Array(H * (1 + W * 3));
+    let p = 0;
+    for (let y = 0; y < H; y++) {
+        cru[p++] = 0;
+        const t = y / (H - 1);
+        const r = Math.round(dalt[0] + (baix[0] - dalt[0]) * t);
+        const g = Math.round(dalt[1] + (baix[1] - dalt[1]) * t);
+        const b = Math.round(dalt[2] + (baix[2] - dalt[2]) * t);
+        for (let x = 0; x < W; x++) {
+            // Marc clar per donar-hi aspecte de caràtula
+            const vora = x < 2 || x >= W - 2 || y < 2 || y >= H - 2;
+            cru[p++] = vora ? Math.min(255, r + 40) : r;
+            cru[p++] = vora ? Math.min(255, g + 40) : g;
+            cru[p++] = vora ? Math.min(255, b + 40) : b;
+        }
+    }
+
+    // zlib amb blocs "stored": 2 bytes de capçalera + blocs + adler32
+    const MAX = 65535;
+    const nBlocs = Math.ceil(cru.length / MAX);
+    const zlib = new Uint8Array(2 + nBlocs * 5 + cru.length + 4);
+    let q = 0;
+    zlib[q++] = 0x78; zlib[q++] = 0x01;
+    for (let i = 0; i < cru.length; i += MAX) {
+        const tros = cru.subarray(i, Math.min(i + MAX, cru.length));
+        const ultim = i + MAX >= cru.length ? 1 : 0;
+        zlib[q++] = ultim;
+        zlib[q++] = tros.length & 255;
+        zlib[q++] = (tros.length >>> 8) & 255;
+        zlib[q++] = ~tros.length & 255;
+        zlib[q++] = (~tros.length >>> 8) & 255;
+        zlib.set(tros, q); q += tros.length;
+    }
+    zlib.set(u32(adler32(cru)), q); q += 4;
+
+    const ihdr = new Uint8Array(13);
+    ihdr.set(u32(W), 0);
+    ihdr.set(u32(H), 4);
+    ihdr[8] = 8;    // 8 bits per canal
+    ihdr[9] = 2;    // color RGB
+    const parts = [
+        new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]),
+        troç("IHDR", ihdr),
+        troç("IDAT", zlib.subarray(0, q)),
+        troç("IEND", new Uint8Array(0)),
+    ];
+    const total = parts.reduce((n, x) => n + x.length, 0);
+    const png = new Uint8Array(total);
+    let o = 0;
+    for (const x of parts) { png.set(x, o); o += x.length; }
+    return png;
+}
+
 function posterGenerat(titol) {
     return `${globalThis.__origin || ""}/poster?t=${encodeURIComponent(titol || "?")}`;
 }
@@ -1034,13 +1192,36 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
         .replace(/[^a-z0-9\s]/g, " ")
         .replace(/\s+/g, " ").trim();
 
+    // Compara sense espais: "Full Metal Alchemist" ↔ "Fullmetal Alchemist"
+    const compacta = (t) => normalitza(t).replace(/\s+/g, "");
+
+    // Proporció de paraules compartides. Rescata títols amb l'ordre canviat,
+    // articles de més o subtítols afegits.
+    function solapament(a, b) {
+        const A = new Set(normalitza(a).split(" ").filter((w) => w.length > 2));
+        const B = new Set(normalitza(b).split(" ").filter((w) => w.length > 2));
+        if (A.size === 0 || B.size === 0) return 0;
+        let comuns = 0;
+        for (const w of A) if (B.has(w)) comuns++;
+        return comuns / Math.min(A.size, B.size);
+    }
+
     function puntua(result, consulta) {
         const cand = [result.name, result.title, result.original_name, result.original_title]
-            .filter(Boolean).map(normalitza);
+            .filter(Boolean);
+        const candN = cand.map(normalitza);
         const q = normalitza(consulta);
-        if (cand.includes(q)) return 3;
-        if (cand.some((c) => c.startsWith(q) || q.startsWith(c))) return 2;
-        if (cand.some((c) => c.includes(q) || q.includes(c))) return 1;
+        const qC = compacta(consulta);
+
+        if (candN.includes(q)) return 3;
+        // Igualtat un cop tretes les separacions de paraules
+        if (cand.some((c) => compacta(c) === qC)) return 3;
+        if (candN.some((c) => c.startsWith(q) || q.startsWith(c))) return 2;
+        if (cand.some((c) => compacta(c).startsWith(qC) || qC.startsWith(compacta(c)))) return 2;
+        // Totes les paraules significatives d'un títol són a l'altre
+        if (cand.some((c) => solapament(c, consulta) >= 0.99)) return 2;
+        if (candN.some((c) => c.includes(q) || q.includes(c))) return 1;
+        if (cand.some((c) => solapament(c, consulta) >= 0.6)) return 1;
         return 0;
     }
 
@@ -1423,11 +1604,13 @@ async function walkCollectionFiles(rootFolderId, accessToken, maxDepth = 6) {
     return resultats;
 }
 
-const SXE_REGEX = /\bs(\d{1,2})[ ._-]?e(\d{1,3})\b/i;
-const NXM_REGEX = /\b(\d{1,2})x(\d{1,3})\b/i;
+// El separador pot ser una "x" llatina o el signe de multiplicació "×" (U+00D7),
+// que és el que fan servir molts arxius i el que feia fallar el reconeixement.
+const SXE_REGEX = /\bs(\d{1,2})\s*[ ._×x-]?\s*e(\d{1,3})\b/i;
+const NXM_REGEX = /\b(\d{1,2})\s*[x×]\s*(\d{1,3})\b/i;
 const TEMPORADA_EP_REGEX = /\b(?:temporada|season|saga|temp|st)[\s._-]*(\d{1,2})[\s._-]*(?:cap[íi]tol|episodi|episode|ep|cap)[\s._-]*(\d{1,3})\b/i;
 // Format català molt estès: "T1xC11", "T01 C11", "T2xC05", "1xC11".
-const TXC_REGEX = /\bT?\s*(\d{1,2})\s*[x×]?\s*C\s*(\d{1,3})\b/i;
+const TXC_REGEX = /\bT\s*(\d{1,2})\s*[x×]?\s*C\s*(\d{1,3})\b/i;
 const EP_EXPLICIT_REGEX = /\b(?:cap[íi]tol|episodi|episode|ep|cap)[\s._-]*(\d{1,3})\b/i;
 // Número solt: prioritza el que està separat per guions/espais (ex. "Bola de Drac - 042 - Títol")
 const NUMERO_SEPARAT_REGEX = /(?:^|[\s._-])(\d{1,3})(?=[\s._-]|$)/;
@@ -1705,10 +1888,25 @@ function trobaEpisodis(fitxersRuta, targetSeason, targetEpisode, structure) {
         if (matches.length) return { matches, estrategia: "pla-T1" };
     }
 
-    // 5. Últim recurs: qualsevol fitxer amb aquest número d'episodi,
-    //    ordenant per posició dins la carpeta per donar el més probable primer
+    // 5. Qualsevol fitxer amb aquest número d'episodi
     matches = items.filter((i) => i.episode === targetEpisode);
     if (matches.length) return { matches, estrategia: "número-solt" };
+
+    // 6. Últim recurs: ordre posicional. Quan cap fitxer porta número
+    //    reconeixible (o tots donen el mateix), l'única pista fiable és
+    //    l'ordre alfanumèric en què Drive els ha retornat. L'episodi N és
+    //    llavors el fitxer que fa N.
+    const numerats = items.filter((i) => i.episode != null);
+    const capNumeracioUtil =
+        numerats.length === 0 ||
+        new Set(numerats.map((i) => i.episode)).size <= 1;
+
+    if (capNumeracioUtil) {
+        const absOrdinal = absolut != null ? absolut : (targetSeason === 1 ? targetEpisode : null);
+        if (absOrdinal != null && absOrdinal >= 1 && absOrdinal <= items.length) {
+            return { matches: [items[absOrdinal - 1]], estrategia: "posicional" };
+        }
+    }
 
     return { matches: [], estrategia: "cap" };
 }
@@ -1915,50 +2113,15 @@ async function handleRequest(request) {
         // Caràtula generada al vol. És l'última xarxa de seguretat: quan no
         // hi ha imatge ni a TMDB ni a btttr.cc, val més una portada amb el
         // títol que no pas el requadre buit. No costa cap subpetició.
+        // Caràtula generada al vol, en PNG. L'especificació de Stremio demana
+        // PNG: un SVG no es renderitza i queda el requadre buit. Aquí generem
+        // un PNG mínim (degradat vertical de color estable segons el títol)
+        // sense cap dependència externa ni cap subpetició.
         if (url.pathname === "/poster") {
-            const titol = (url.searchParams.get("t") || "?").slice(0, 60);
-            const esc = (t) => t.replace(/[<>&"']/g, (c) => ({
-                "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;", "'": "&#39;",
-            }[c]));
-
-            // Color estable derivat del títol: cada obra té sempre el mateix
-            const codi = [...titol].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7);
-            const to = codi % 360;
-
-            // Partim el títol en línies de ~16 caràcters sense trencar paraules
-            const paraules = titol.split(/\s+/);
-            const linies = [];
-            let actual = "";
-            for (const w of paraules) {
-                if ((actual + " " + w).trim().length > 16 && actual) {
-                    linies.push(actual.trim());
-                    actual = w;
-                } else {
-                    actual = (actual + " " + w).trim();
-                }
-            }
-            if (actual) linies.push(actual);
-            const visibles = linies.slice(0, 6);
-
-            const inicial = 300 - (visibles.length - 1) * 26;
-            const textos = visibles.map((l, i) =>
-                `<text x="200" y="${inicial + i * 52}" text-anchor="middle" ` +
-                `font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" ` +
-                `font-size="40" font-weight="600" fill="#ffffff">${esc(l)}</text>`
-            ).join("");
-
-            const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="400" height="600" viewBox="0 0 400 600">
-<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
-<stop offset="0%" stop-color="hsl(${to},45%,32%)"/>
-<stop offset="100%" stop-color="hsl(${(to + 40) % 360},50%,14%)"/>
-</linearGradient></defs>
-<rect width="400" height="600" fill="url(#g)"/>
-<rect x="20" y="20" width="360" height="560" fill="none" stroke="rgba(255,255,255,.15)" stroke-width="2" rx="8"/>
-${textos}
-</svg>`;
-            return new Response(svg, {
+            const titol = url.searchParams.get("t") || "?";
+            return new Response(pngDegradat(titol), {
                 headers: {
-                    "Content-Type": "image/svg+xml; charset=utf-8",
+                    "Content-Type": "image/png",
                     "Cache-Control": "public, max-age=31536000",
                     "Access-Control-Allow-Origin": "*",
                 },
@@ -2610,6 +2773,15 @@ async function findCollectionFolder(imdbId, accessToken) {
         if (mapping.type === "series") return mapping.id;
     }
 
+    // El mapa persistent ja té la correspondència si /omplir l'ha resolt.
+    // És una consulta en memòria, sense cap crida externa.
+    const delMapa = await buscaAlMapa(imdbId);
+    if (delMapa?.tipus === "series" && delMapa.ids.length) {
+        IMDB_TO_GDRIVE.set(imdbId, { type: "series", id: delMapa.ids[0] });
+        console.log({ message: "Carpeta trobada al mapa", imdbId, folderId: delMapa.ids[0] });
+        return delMapa.ids[0];
+    }
+
     const titles = await getTitolsAlternatius(imdbId, "series");
     if (titles.length === 0) return null;
     const titlesNorm = titles.map(normalitzaTitol).filter(Boolean);
@@ -2648,6 +2820,25 @@ async function findCollectionFolder(imdbId, accessToken) {
 }
 
 async function findMovieFiles(imdbId, accessToken) {
+    // 1r: el mapa persistent. Cada entrada "m:<fileId>" resolta per /omplir
+    // ja porta el seu imdbId, així que aquí no cal ni cercar ni endevinar.
+    const delMapa = await buscaAlMapa(imdbId);
+    if (delMapa?.tipus === "movie" && delMapa.ids.length) {
+        const fitxers = [];
+        for (const fileId of delMapa.ids.slice(0, 8)) {
+            if (!quedaPressupost(4)) break;
+            try {
+                const f = await fetchFile(fileId, accessToken);
+                if (f) fitxers.push(f);
+            } catch (e) { /* el fitxer pot haver desaparegut */ }
+        }
+        if (fitxers.length) {
+            console.log({ message: "Fitxers trobats al mapa", imdbId, count: fitxers.length });
+            return fitxers;
+        }
+    }
+
+    // 2n: cerca per títol al Drive (per a fitxers encara no resolts)
     const titles = await getTitolsAlternatius(imdbId, "movie");
     if (titles.length === 0) return [];
 
@@ -2885,6 +3076,7 @@ export default {
         reiniciaPressupost(46);
         MAPA = null;
         MAPA_BRUT = false;
+        INDEX_INVERS = null;
         globalThis.__ctx = ctx;
 
         return handleRequest(request);
