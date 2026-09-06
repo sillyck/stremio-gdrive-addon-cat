@@ -73,7 +73,7 @@ const CONFIG = {
 
 // Identificador de la versió del codi. Serveix per verificar via /versio
 // quina versió s'està executant realment al worker.
-const VERSIO_CODI = "2026-09-06.getSeasonStructure-restaurada+lint";
+const VERSIO_CODI = "2026-09-06.extres-omesos+cau-recorregut";
 
 const MANIFEST = {
     id: "stremio.gdrive.worker.cat",
@@ -1725,20 +1725,97 @@ async function listChildren(folderId, accessToken, { onlyFolders = false, onlyFi
     return items;
 }
 
+// Carpetes que dins d'una col·lecció NO contenen episodis de la sèrie:
+// extres, bandes sonores, obertures, pel·lícules, OVAs, especials... Cal
+// saltar-les per dos motius, tots dos importants:
+//   1. CORRECCIÓ. Un tema musical "01 - Opening.mp3" o una OVA numerada 01
+//      compta com a episodi 1 i apareix com a opció d'un episodi que no és.
+//   2. PRESSUPOST. La carpeta d'El Detectiu Conan té desenes de subcarpetes
+//      d'extres, i recórrer-les esgotava el límit de subpeticions abans
+//      d'arribar als episodis de veritat.
+const CARPETES_NO_EPISODIS = new RegExp(
+    "^\\s*(?:" + [
+        "extres?", "extras?", "bonus", "especials?", "specials?",
+        "m[úu]sica?", "music", "ost", "soundtracks?", "singles?",
+        "op(?:s)?(?:[\\s&_-]*ed(?:s)?)?", "ed(?:s)?", "openings?", "endings?",
+        "pel[·.]?l[íi]cules?", "pelis?", "movies?", "films?",
+        "ova(?:s)?", "oav(?:s)?", "ona(?:s)?",
+        "scans?", "artbooks?", "manga", "covers?", "car[àa]tules?",
+        "subs?", "subt[íi]tols?", "subtitles?",
+        "trailers?", "previews?", "nc(?:op|ed)",
+    ].join("|") + ")\\s*$",
+    "i"
+);
+
+function esCarpetaDExtres(nom) {
+    if (CARPETES_NO_EPISODIS.test(nom)) return true;
+    // Comença per la paraula: "Extres i coses", "Music Collection"…
+    if (/^\s*(?:extres?|extras?|m[úu]sica?|music|ost|ova|oav|ona|nc)\b[\s&_-]/i.test(nom)) return true;
+    // Acaba en OST: "Series OST", "Movies OST"
+    if (/\bost\s*$/i.test(nom)) return true;
+    return false;
+}
+
+// ── Memòria cau del recorregut ────────────────────────────────────────────
+// Recórrer una col·lecció gran costa una subpetició per carpeta, i amb el
+// límit de 50 del pla gratuït una sèrie amb moltes subcarpetes s'esgotava a
+// mig camí (era el cas d'El Detectiu Conan). Desem l'arbre de fitxers ja
+// recorregut: la següent petició el llegeix amb UNA sola subpetició i, a
+// més, el llistat és complet.
+function clauCauRecorregut(folderId) {
+    return `https://gdrive-addon.local/__walk_v1/${folderId}`;
+}
+
+async function llegeixRecorregutDelCau(folderId) {
+    try {
+        if (typeof caches === "undefined" || !consumeix(1)) return null;
+        const r = await caches.default.match(new Request(clauCauRecorregut(folderId)));
+        if (!r) return null;
+        const dades = await r.json();
+        console.log({ message: "Recorregut recuperat del cau", folderId, fitxers: dades.length });
+        return dades;
+    } catch (e) {
+        return null;
+    }
+}
+
+async function desaRecorregutAlCau(folderId, fitxers) {
+    try {
+        if (typeof caches === "undefined") return;
+        const r = new Response(JSON.stringify(fitxers), {
+            headers: {
+                "Content-Type": "application/json",
+                "Cache-Control": "max-age=86400",   // un dia
+            },
+        });
+        const promesa = caches.default.put(new Request(clauCauRecorregut(folderId)), r);
+        if (globalThis.__ctx?.waitUntil) globalThis.__ctx.waitUntil(promesa);
+        else await promesa;
+    } catch (e) { /* el cau és una optimització, no una dependència */ }
+}
+
 async function walkCollectionFiles(rootFolderId, accessToken, maxDepth = 6) {
+    const delCau = await llegeixRecorregutDelCau(rootFolderId);
+    if (delCau) return delCau;
+
     const resultats = [];
+    const saltades = [];
+    let complet = true;
 
     async function recorre(folderId, ruta, profunditat) {
         if (profunditat > maxDepth) return;
-        // Si ens quedem sense pressupost de subpeticions, parem: val més
-        // retornar els fitxers trobats fins ara que no pas fallar del tot.
         if (!quedaPressupost(4)) {
+            complet = false;
             console.log({ message: "Pressupost exhaurit recorrent la col·lecció", ruta });
             return;
         }
         const fills = await listChildren(folderId, accessToken);
         for (const item of fills) {
             if (item.mimeType === FOLDER_MIME) {
+                if (esCarpetaDExtres(item.name)) {
+                    saltades.push([...ruta, item.name].join("/"));
+                    continue;
+                }
                 await recorre(item.id, [...ruta, item.name], profunditat + 1);
             } else if (VIDEO_EXT_REGEX.test(item.name)) {
                 resultats.push({ file: item, ruta: [...ruta, item.name] });
@@ -1747,8 +1824,20 @@ async function walkCollectionFiles(rootFolderId, accessToken, maxDepth = 6) {
     }
 
     await recorre(rootFolderId, [], 0);
+    if (saltades.length) {
+        console.log({ message: "Carpetes d'extres omeses", saltades: saltades.slice(0, 12) });
+    }
+    // Només desem el recorregut si ha estat COMPLET. Desar-ne un de truncat
+    // congelaria una llista incompleta durant tot un dia.
+    if (complet && resultats.length > 0) {
+        await desaRecorregutAlCau(rootFolderId, resultats);
+        console.log({ message: "Recorregut complet desat al cau", rootFolderId, fitxers: resultats.length });
+    } else if (!complet) {
+        console.log({ message: "Recorregut incomplet: no es desa al cau", rootFolderId, fitxers: resultats.length });
+    }
     return resultats;
 }
+
 
 // El separador pot ser una "x" llatina o el signe de multiplicació "×" (U+00D7),
 // que és el que fan servir molts arxius i el que feia fallar el reconeixement.

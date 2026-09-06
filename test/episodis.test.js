@@ -122,6 +122,17 @@ console.log("\n── Sèrie llarga de moltes temporades amb numeració absoluta
   prova(`cap petició retorna episodis de sobra`, massa===0);
 }
 
+console.log("\n── Exclusió de carpetes d'extres (cas real d'El Detectiu Conan)");
+{
+  const esExtra = ctx.esCarpetaDExtres;
+  const omet = ["Extres","Pelis","OVAs","OPs EDs","Music","Singles","Series OST",
+                "Movies OST","Extras","Especials","NCOP","Trailers","OST"];
+  const recorre = ["Multi-Audio+Subs","Temporada 1","Season 2","T3","01","Episodis",
+                   "Capitols","Saga Freezer","Arc 1","Opening Act","Edward i Alphonse"];
+  prova(`${omet.length} carpetes d'extres s'ometen`, omet.every(esExtra));
+  prova(`${recorre.length} carpetes d'episodis es recorren`, recorre.every((n) => !esExtra(n)));
+}
+
 console.log("\n"+"═".repeat(72));
 console.log(fall===0 ? `TOTES LES ${total} PROVES PASSEN` : `${fall} de ${total} PROVES FALLEN`);
 process.exit(fall?1:0);
