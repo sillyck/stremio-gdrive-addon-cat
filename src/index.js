@@ -1727,309 +1727,226 @@ async function walkCollectionFiles(rootFolderId, accessToken, maxDepth = 6) {
 
 // El separador pot ser una "x" llatina o el signe de multiplicació "×" (U+00D7),
 // que és el que fan servir molts arxius i el que feia fallar el reconeixement.
-const SXE_REGEX = /\bs(\d{1,2})\s*[ ._×x-]?\s*e(\d{1,3})\b/i;
-const NXM_REGEX = /\b(\d{1,2})\s*[x×]\s*(\d{1,3})\b/i;
-const TEMPORADA_EP_REGEX = /\b(?:temporada|season|saga|temp|st)[\s._-]*(\d{1,2})[\s._-]*(?:cap[íi]tol|episodi|episode|ep|cap)[\s._-]*(\d{1,3})\b/i;
-// Format català molt estès: "T1xC11", "T01 C11", "T2xC05", "1xC11".
-const TXC_REGEX = /\bT\s*(\d{1,2})\s*[x×]?\s*C\s*(\d{1,3})\b/i;
-const EP_EXPLICIT_REGEX = /\b(?:cap[íi]tol|episodi|episode|ep|cap)[\s._-]*(\d{1,3})\b/i;
-// Número solt: prioritza el que està separat per guions/espais (ex. "Bola de Drac - 042 - Títol")
-const NUMERO_SEPARAT_REGEX = /(?:^|[\s._-])(\d{1,3})(?=[\s._-]|$)/;
-const NUMERO_PLA_REGEX = /(\d{1,4})(?!\d)/;
+// ═══════════════════════════════════════════════════════════════════════════
+// NUMERACIÓ D'EPISODIS
+//
+// Principi de disseny: MAI analitzar un fitxer aïlladament. Provem cada patró
+// contra TOT el conjunt de fitxers de la sèrie i ens quedem amb el que
+// realment discrimina. Un patró que assigna el mateix número a tots els
+// fitxers ha fallat per definició, i abans això passava desapercebut: era la
+// causa que clicar un episodi retornés desenes de fitxers equivocats.
+//
+// El llistat d'episodis i la cerca d'streams comparteixen aquesta mateixa
+// funció. Si divergissin, el fitxer que es llista com a episodi N no seria el
+// que es reprodueix en clicar-lo.
+// ═══════════════════════════════════════════════════════════════════════════
 
-// Treu de l'anàlisi trossos del nom que contenen números que NO són episodis
-// (resolucions, anys, codecs, mides) per evitar falsos positius.
+const SXE_REGEX = /\bs\s*(\d{1,2})\s*[ ._×x-]?\s*e\s*(\d{1,3})\b/i;
+const TXC_REGEX = /\bT\s*(\d{1,2})\s*[x×._-]?\s*C\s*(\d{1,3})\b/i;
+const TEMPORADA_EP_REGEX = /\b(?:temporada|season|saga|temp)[\s._-]*(\d{1,2})[\s._-]*(?:cap[íi]tol|episodi|episode|ep|cap)[\s._-]*(\d{1,3})\b/i;
+const NXM_REGEX = /\b(\d{1,2})\s*[x×]\s*(\d{1,3})\b/i;
+const EP_EXPLICIT_REGEX = /\b(?:cap[íi]tol|episodi|episode|ep|cap)[\s._-]*(\d{1,3})\b/i;
+
+// Ordenats de més específic a més genèric. En cas d'empat de puntuació guanya
+// el primer, que és el més fiable.
+const PATRONS_EPISODI = [
+    { nom: "SxE",     re: SXE_REGEX,            gTemp: 1, gEp: 2 },
+    { nom: "TxC",     re: TXC_REGEX,            gTemp: 1, gEp: 2 },
+    { nom: "TempEp",  re: TEMPORADA_EP_REGEX,   gTemp: 1, gEp: 2 },
+    { nom: "NxM",     re: NXM_REGEX,            gTemp: 1, gEp: 2 },
+    { nom: "EpMot",   re: EP_EXPLICIT_REGEX,    gTemp: 0, gEp: 1 },
+    { nom: "EpFinal", re: /[\s._-](\d{1,3})\s*$/, gTemp: 0, gEp: 1 },
+    { nom: "NumSep",  re: /(?:^|[\s._-])(\d{1,3})(?=[\s._-]|$)/, gTemp: 0, gEp: 1 },
+    { nom: "NumQual", re: /(\d{1,4})(?!\d)/,    gTemp: 0, gEp: 1 },
+];
+
+const ESQUEMES_AMB_TEMPORADA = ["SxE", "TxC", "TempEp", "NxM"];
+
+// Elimina del nom els trossos numèrics que NO són números d'episodi
+// (resolucions, anys, còdecs, mides, versions), perquè no contaminin la cerca.
 function netejaSorollNumeric(nom) {
     return nom
-        .replace(/\.[a-z0-9]{2,4}$/i, "")
+        .replace(/\.[a-z0-9]{2,4}$/i, " ")
         .replace(/\[.*?\]/g, " ")
         .replace(/\b\d{3,4}p\b/gi, " ")
         .replace(/\b(?:19|20)\d{2}\b/g, " ")
-        .replace(/\bx26[45]\b/gi, " ")
+        .replace(/\bx?26[45]\b/gi, " ")
         .replace(/\bh\.?26[45]\b/gi, " ")
-        .replace(/\b\d+(?:\.\d+)?\s*(?:GB|MB|kbps|fps|bit)\b/gi, " ")
-        .replace(/\b(?:AC3|DTS|AAC|FLAC|DD)\s*\d?(?:\.\d)?\b/gi, " ")
+        .replace(/\bv\d+\b/gi, " ")
+        .replace(/\b\d+(?:\.\d+)?\s*(?:GB|MB|kbps|fps|bits?)\b/gi, " ")
+        .replace(/\b(?:AC3|DTS|AAC|FLAC|DD[P+]?)\s*\d?(?:\.\d)?\b/gi, " ")
         .replace(/\b\d+\s*ch\b/gi, " ")
-        .replace(/\b4K\b/gi, " ");
+        .replace(/\b4K\b/gi, " ")
+        .replace(/\bby\s+\w+/gi, " ")
+        .replace(/\s+/g, " ")
+        .trim();
 }
 
-function extreuNumeroEpisodi(nomArxiu) {
-    const net = netejaSorollNumeric(nomArxiu);
-
-    let m = SXE_REGEX.exec(net);
-    if (m) return { season: parseInt(m[1], 10), episode: parseInt(m[2], 10), font: "SxE" };
-
-    m = TEMPORADA_EP_REGEX.exec(net);
-    if (m) return { season: parseInt(m[1], 10), episode: parseInt(m[2], 10), font: "SxE" };
-
-    m = TXC_REGEX.exec(net);
-    if (m) return { season: parseInt(m[1], 10), episode: parseInt(m[2], 10), font: "TxC" };
-
-    m = NXM_REGEX.exec(net);
-    if (m) return { season: parseInt(m[1], 10), episode: parseInt(m[2], 10), font: "NxM" };
-
-    m = EP_EXPLICIT_REGEX.exec(net);
-    if (m) return { season: null, episode: parseInt(m[1], 10), font: "pla" };
-
-    m = NUMERO_SEPARAT_REGEX.exec(net);
-    if (m) return { season: null, episode: parseInt(m[1], 10), font: "pla" };
-
-    m = NUMERO_PLA_REGEX.exec(net);
-    if (m) return { season: null, episode: parseInt(m[1], 10), font: "pla" };
-
+// Temporada indicada per alguna carpeta de la ruta ("Temporada 2", "T3", "02")
+function temporadaDeCarpeta(ruta) {
+    for (let i = ruta.length - 2; i >= 0; i--) {
+        const c = ruta[i];
+        let m = /\b(?:temporada|season|saga|temp)[\s._-]*(\d{1,2})\b/i.exec(c);
+        if (m) return parseInt(m[1], 10);
+        m = /^\s*[TS]\s*(\d{1,2})\s*$/i.exec(c);
+        if (m) return parseInt(m[1], 10);
+        m = /^\s*(\d{1,2})\s*$/.exec(c);
+        if (m) return parseInt(m[1], 10);
+    }
     return null;
 }
 
-// Obté quants episodis té cada temporada segons TMDB. Això és el que permet
-// convertir una numeració absoluta (ex. One Piece 001..1100) a season/episode
-// i viceversa, que és la causa principal del desordre d'episodis.
-async function getSeasonStructure(imdbId) {
-    if (SEASON_STRUCTURE_CACHE.has(imdbId)) return SEASON_STRUCTURE_CACHE.get(imdbId);
-    if (!CONFIG.tmdbApiKey) return null;
-
-    try {
-        const findUrl = API_ENDPOINTS.TMDB_FIND
-            .replace("{id}", imdbId)
-            .replace("{apiKey}", CONFIG.tmdbApiKey);
-        const findRes = await fetch(findUrl);
-        if (!findRes.ok) return null;
-        const findData = await findRes.json();
-        const tv = findData.tv_results?.[0];
-        if (!tv) {
-            SEASON_STRUCTURE_CACHE.set(imdbId, null);
-            return null;
-        }
-
-        const tvUrl = API_ENDPOINTS.TMDB_TV
-            .replace("{id}", tv.id)
-            .replace("{apiKey}", CONFIG.tmdbApiKey)
-            .replace("{lang}", "en");
-        const tvRes = await fetch(tvUrl);
-        if (!tvRes.ok) return null;
-        const tvData = await tvRes.json();
-
-        // Comptes d'episodis per temporada, ignorant la temporada 0 (especials)
-        const counts = [];
-        for (const s of tvData.seasons || []) {
-            if (s.season_number === 0) continue;
-            counts[s.season_number] = s.episode_count || 0;
-        }
-        const structure = counts.length > 1 ? counts : null;
-        SEASON_STRUCTURE_CACHE.set(imdbId, structure);
-        return structure;
-    } catch (e) {
-        return null;
+// Mesura com de bé un patró separa els fitxers entre ells
+function avaluaPatro(patro, items) {
+    const assignacions = [];
+    let encerts = 0;
+    for (const it of items) {
+        const m = patro.re.exec(it.net);
+        if (!m) { assignacions.push(null); continue; }
+        const ep = parseInt(m[patro.gEp], 10);
+        if (!Number.isFinite(ep)) { assignacions.push(null); continue; }
+        const temp = patro.gTemp ? parseInt(m[patro.gTemp], 10) : null;
+        assignacions.push({ season: temp, episode: ep });
+        encerts++;
     }
+    if (encerts === 0) return { patro, puntuacio: 0, assignacions, encerts, distints: 0 };
+
+    const claus = new Set(
+        assignacions.filter(Boolean).map((a) => `${a.season ?? "-"}:${a.episode}`)
+    );
+
+    // Guarda de seguretat: si un patró assigna el MATEIX valor a més de dos
+    // fitxers, no està reconeixent res — el descartem del tot.
+    if (claus.size === 1 && encerts > 2) {
+        return { patro, puntuacio: 0, assignacions, encerts, distints: 1, motiu: "col·lapsa" };
+    }
+
+    return {
+        patro,
+        puntuacio: (encerts / items.length) * (claus.size / encerts),
+        assignacions, encerts, distints: claus.size,
+    };
 }
 
-// Converteix season/episode → número absolut fent servir l'estructura TMDB.
-// Ex. amb T1=26 episodis, S02E05 → absolut 31.
-function aAbsolut(season, episode, structure) {
-    if (!structure) return null;
+function detectaEsquema(fitxersRuta) {
+    const items = fitxersRuta.map((f) => {
+        const nomArxiu = f.ruta[f.ruta.length - 1];
+        return {
+            file: f.file,
+            ruta: f.ruta,
+            nomArxiu,
+            net: netejaSorollNumeric(nomArxiu),
+            seasonCarpeta: temporadaDeCarpeta(f.ruta),
+        };
+    });
+
+    let millor = null;
+    for (const p of PATRONS_EPISODI) {
+        const r = avaluaPatro(p, items);
+        if (!millor || r.puntuacio > millor.puntuacio + 1e-9) millor = r;
+    }
+
+    // Cap patró és prou fiable: caiem a l'ordre alfanumèric amb què Drive ens
+    // ha retornat els fitxers. No és perfecte, però dona episodis DIFERENTS
+    // per a peticions diferents, que és el mínim exigible.
+    if (!millor || millor.puntuacio < 0.3) {
+        items.forEach((it, i) => {
+            it.season = it.seasonCarpeta ?? 1;
+            it.episode = i + 1;
+            it.font = "posicional";
+        });
+        return { items, esquema: "posicional" };
+    }
+
+    items.forEach((it, i) => {
+        const a = millor.assignacions[i];
+        it.episode = a ? a.episode : null;
+        it.season = a?.season ?? it.seasonCarpeta ?? null;
+        it.font = millor.patro.nom;
+    });
+    return { items, esquema: millor.patro.nom };
+}
+
+// Converteix temporada/episodi a número absolut segons l'estructura de TMDB.
+// Ex.: amb T1 de 26 episodis, S02E05 és l'absolut 31.
+function aAbsolut(season, episode, estructura) {
+    if (!estructura) return null;
     let total = 0;
     for (let s = 1; s < season; s++) {
-        if (structure[s] == null) return null;
-        total += structure[s];
+        if (estructura[s] == null) return null;
+        total += estructura[s];
     }
     return total + episode;
 }
 
-// Treu el primer número que apareix en un nom de carpeta (ex. "Saga 02" -> 2,
-// "Temporada 10" -> 10), per poder ordenar sagues/temporades correctament en
-// lloc de dependre de l'ordre en què Drive les ha retornat.
-function primerNumeroDe(text) {
-    const m = /(\d{1,3})/.exec(text);
-    return m ? parseInt(m[1], 10) : null;
-}
+// Cerca els fitxers de l'episodi demanat.
+// GARANTIA: cap fitxer retornat té un número d'episodi diferent del demanat.
+function trobaEpisodis(fitxersRuta, targetSeason, targetEpisode, estructura) {
+    const { items, esquema } = detectaEsquema(fitxersRuta);
 
-function assignaEpisodis(fitxersRuta) {
-    const ambNumero = [];
-    const senseNumero = [];
-
-    for (const item of fitxersRuta) {
-        const nomArxiu = item.ruta[item.ruta.length - 1];
-        const info = extreuNumeroEpisodi(nomArxiu);
-        if (info) {
-            ambNumero.push({ ...item, ...info });
-        } else {
-            senseNumero.push({ ...item, season: null, episode: null, font: "cap" });
-        }
+    // 1. L'esquema ja porta temporada al nom: coincidència exacta
+    if (ESQUEMES_AMB_TEMPORADA.includes(esquema)) {
+        const m = items.filter(
+            (i) => i.season === targetSeason && i.episode === targetEpisode
+        );
+        return { matches: m, estrategia: esquema, esquema };
     }
 
-    const ambSxE = ambNumero.filter((i) => i.font !== "pla");
-    let episodis = [];
-
-    if (ambNumero.length > 0 && ambSxE.length >= ambNumero.length * 0.5) {
-        // Majoria amb format Sxx/Eyy explícit: fem servir season/episode tal
-        // qual (season pot ser 0 per a "especials" — no ho col·lapsem a 1).
-        // Els que només tenen número pla (minoria) es posen a temporada 1
-        // al final, amb un número d'episodi alt perquè no col·lisionin.
-        episodis = ambNumero
-            .concat(senseNumero.map((i, idx) => ({ ...i, season: 1, episode: 9000 + idx })))
-            .map((i) => ({
-                file: i.file,
-                season: i.season != null ? i.season : 1,
-                episode: i.episode,
-                title: i.ruta[i.ruta.length - 1],
-            }));
-    } else {
-        // Numeració plana o inexistent: agrupem per la carpeta CONTENIDORA
-        // real de cada arxiu (ruta sencera menys el nom de fitxer, no només
-        // el primer nivell) — així funciona igual si els episodis són
-        // directament dins la carpeta de la sèrie, o a qualsevol profunditat
-        // (ex. "Bola de Drac [qualitat]/Saga 01/episodi.mkv": la clau
-        // d'agrupació és "Bola de Drac [qualitat]/Saga 01", no només
-        // "Bola de Drac [qualitat]", que agruparia totes les sagues juntes).
-        const grups = new Map();
-        for (const item of ambNumero.concat(senseNumero)) {
-            const clau =
-                item.ruta.length > 1
-                    ? item.ruta.slice(0, -1).join("/")
-                    : "__ARREL__";
-            if (!grups.has(clau)) grups.set(clau, []);
-            grups.get(clau).push(item);
-        }
-
-        // Ordenem els grups pel número que trobem al nom de la seva carpeta
-        // (ex. "Saga 01" abans que "Saga 02"), i si cap no en té, alfabètic.
-        const clausOrdenades = [...grups.keys()].sort((a, b) => {
-            const nomA = a === "__ARREL__" ? "" : a.split("/").pop();
-            const nomB = b === "__ARREL__" ? "" : b.split("/").pop();
-            const numA = primerNumeroDe(nomA);
-            const numB = primerNumeroDe(nomB);
-            if (numA != null && numB != null && numA !== numB) return numA - numB;
-            if (numA != null && numB == null) return -1;
-            if (numA == null && numB != null) return 1;
-            return nomA.localeCompare(nomB);
-        });
-
-        let numTemporada = 1;
-        for (const clau of clausOrdenades) {
-            const itemsGrup = grups.get(clau);
-            itemsGrup.sort((a, b) => {
-                if (a.episode != null && b.episode != null) return a.episode - b.episode;
-                if (a.episode != null) return -1;
-                if (b.episode != null) return 1;
-                return a.ruta[a.ruta.length - 1].localeCompare(b.ruta[b.ruta.length - 1]);
-            });
-            // Conservem el número d'episodi real quan el tenim (evita que
-            // afegir un episodi antic reordeni els números de tots els
-            // altres al proper refresc); només inventem un número seqüencial
-            // pels que no en tenen cap.
-            let seguentSenseNumero =
-                Math.max(0, ...itemsGrup.map((i) => i.episode).filter((e) => e != null)) + 1;
-            itemsGrup.forEach((item) => {
-                const numEpisodi = item.episode != null ? item.episode : seguentSenseNumero++;
-                episodis.push({
-                    file: item.file,
-                    season: numTemporada,
-                    episode: numEpisodi,
-                    title: item.ruta[item.ruta.length - 1],
-                });
-            });
-            numTemporada++;
-        }
+    // 2. La temporada ve de la carpeta contenidora
+    if (items.some((i) => i.seasonCarpeta != null)) {
+        const m = items.filter(
+            (i) => i.seasonCarpeta === targetSeason && i.episode === targetEpisode
+        );
+        if (m.length) return { matches: m, estrategia: "carpeta+ep", esquema };
     }
 
-    return episodis;
-}
+    // 3. Numeració plana. Si el número més alt supera els episodis de la
+    //    primera temporada, la numeració és absoluta i cal convertir-hi
+    //    la petició (cas típic dels animes llargs).
+    const maxEp = Math.max(0, ...items.map((i) => i.episode || 0));
+    const epsT1 = estructura?.[1] ?? null;
+    const absolut = aAbsolut(targetSeason, targetEpisode, estructura);
 
-// Analitza tots els fitxers d'una col·lecció i n'extreu la informació
-// d'episodi, incloent-hi el context de la carpeta contenidora (que sovint
-// indica la temporada quan el nom del fitxer no ho fa).
-function analitzaFitxers(fitxersRuta) {
-    return fitxersRuta.map((item) => {
-        const nomArxiu = item.ruta[item.ruta.length - 1];
-        const info = extreuNumeroEpisodi(nomArxiu);
-        // Temporada segons la carpeta contenidora (ex. "Temporada 2", "Saga 03")
-        let seasonCarpeta = null;
-        for (let i = item.ruta.length - 2; i >= 0; i--) {
-            const carpeta = item.ruta[i];
-            const m = /\b(?:temporada|season|saga|temp|t|s)[\s._-]*(\d{1,2})\b/i.exec(carpeta);
-            if (m) { seasonCarpeta = parseInt(m[1], 10); break; }
-            const soloNum = /^(\d{1,2})$/.exec(carpeta.trim());
-            if (soloNum) { seasonCarpeta = parseInt(soloNum[1], 10); break; }
-        }
-        // Candidat secundari: el primer número "aïllat" del nom. Serveix quan
-        // el nom conté tant una numeració absoluta com una paraula com
-        // "episodi N" dins del títol de l'episodi.
-        let numeroInicial = null;
-        const mi = NUMERO_SEPARAT_REGEX.exec(netejaSorollNumeric(nomArxiu));
-        if (mi) numeroInicial = parseInt(mi[1], 10);
+    if (epsT1 != null && maxEp > epsT1 && absolut != null) {
+        const m = items.filter((i) => i.episode === absolut);
+        if (m.length) return { matches: m, estrategia: "absolut", esquema };
+    }
 
-        return {
-            file: item.file,
-            ruta: item.ruta,
-            nomArxiu,
-            season: info?.season ?? null,
-            episode: info?.episode ?? null,
-            font: info?.font ?? "cap",
-            seasonCarpeta,
-            numeroInicial,
-        };
-    });
-}
+    if (targetSeason === 1 || !estructura) {
+        const m = items.filter((i) => i.episode === targetEpisode);
+        if (m.length) return { matches: m, estrategia: "pla", esquema };
+    }
 
-// Troba els fitxers que corresponen a la temporada/episodi demanats.
-// Prova diverses estratègies en ordre de fiabilitat i retorna la primera
-// que doni resultats — així funciona tant si els fitxers estan numerats
-// SxxEyy, com per temporada en carpetes, com amb numeració absoluta.
-function trobaEpisodis(fitxersRuta, targetSeason, targetEpisode, structure) {
-    const items = analitzaFitxers(fitxersRuta);
-    const absolut = aAbsolut(targetSeason, targetEpisode, structure);
-
-    // 1. SxxEyy explícit al nom del fitxer — el senyal més fiable
-    let matches = items.filter(
-        (i) => i.font !== "pla" && i.font !== "cap" &&
-               i.season === targetSeason && i.episode === targetEpisode
-    );
-    if (matches.length) return { matches, estrategia: "SxE" };
-
-    // 2. Temporada per carpeta + número d'episodi al fitxer
-    matches = items.filter(
-        (i) => i.seasonCarpeta === targetSeason && i.episode === targetEpisode
-    );
-    if (matches.length) return { matches, estrategia: "carpeta+ep" };
-
-    // 3. Numeració absoluta (One Piece 001..1100) via estructura TMDB
     if (absolut != null) {
-        matches = items.filter(
-            (i) => (i.font === "pla" || i.season == null) &&
-                   (i.episode === absolut || i.numeroInicial === absolut)
-        );
-        if (matches.length) return { matches, estrategia: "absolut" };
+        const m = items.filter((i) => i.episode === absolut);
+        if (m.length) return { matches: m, estrategia: "absolut-2", esquema };
     }
 
-    // 4. Sèrie d'una sola temporada (o carpeta plana): número directe
-    if (targetSeason === 1) {
-        matches = items.filter(
-            (i) => (i.font === "pla" || i.season == null) &&
-                   (i.episode === targetEpisode || i.numeroInicial === targetEpisode)
-        );
-        if (matches.length) return { matches, estrategia: "pla-T1" };
-    }
+    return { matches: [], estrategia: "cap", esquema };
+}
 
-    // 5. Qualsevol fitxer amb aquest número d'episodi
-    matches = items.filter((i) => i.episode === targetEpisode);
-    if (matches.length) return { matches, estrategia: "número-solt" };
+// Llistat d'episodis per al catàleg propi. Fa servir EXACTAMENT la mateixa
+// detecció que la cerca d'streams: si divergissin, el fitxer llistat com a
+// episodi N no seria el que es reprodueix en clicar-lo.
+function assignaEpisodis(fitxersRuta) {
+    const { items, esquema } = detectaEsquema(fitxersRuta);
+    const ambTemporada = ESQUEMES_AMB_TEMPORADA.includes(esquema);
 
-    // 6. Últim recurs: ordre posicional. Quan cap fitxer porta número
-    //    reconeixible (o tots donen el mateix), l'única pista fiable és
-    //    l'ordre alfanumèric en què Drive els ha retornat. L'episodi N és
-    //    llavors el fitxer que fa N.
-    const numerats = items.filter((i) => i.episode != null);
-    const capNumeracioUtil =
-        numerats.length === 0 ||
-        new Set(numerats.map((i) => i.episode)).size <= 1;
+    const episodis = items.map((it) => ({
+        file: it.file,
+        season: ambTemporada
+            ? (it.season != null ? it.season : 1)
+            : (it.seasonCarpeta ?? 1),
+        episode: it.episode,
+        title: it.nomArxiu,
+    }));
 
-    if (capNumeracioUtil) {
-        const absOrdinal = absolut != null ? absolut : (targetSeason === 1 ? targetEpisode : null);
-        if (absOrdinal != null && absOrdinal >= 1 && absOrdinal <= items.length) {
-            return { matches: [items[absOrdinal - 1]], estrategia: "posicional" };
-        }
-    }
+    // Els que no han rebut número van al final, sense col·lisionar
+    let seguent = Math.max(0, ...episodis.map((e) => e.episode || 0)) + 1;
+    for (const e of episodis) if (e.episode == null) e.episode = seguent++;
 
-    return { matches: [], estrategia: "cap" };
+    episodis.sort((a, b) => a.season - b.season || a.episode - b.episode);
+    return episodis;
 }
 
 function buildBaseSearchQuery(query) {
@@ -3077,6 +2994,33 @@ async function getStreams(streamRequest) {
     const streams = [];
     const imdbId = streamRequest.id.split(":")[0];
     const esImdb = imdbId.startsWith("tt");
+
+    // ── ID intern: apunta a un fitxer concret del Drive ───────────────────
+    // El nostre propi catàleg (i el llistat d'episodis de les col·leccions)
+    // fa servir "gdrive:<fileId>". Aquí no cal cercar ni endevinar res: el
+    // fitxer ja està identificat. Sense aquest camí, clicar un episodi del
+    // catàleg propi acabava fent una cerca per títol i podia reproduir un
+    // fitxer que no era el que s'havia triat.
+    if (streamRequest.id.startsWith("gdrive:")) {
+        const fileId = streamRequest.id.slice("gdrive:".length).split(":")[0];
+        try {
+            const accessToken = await getAccessToken();
+            if (accessToken) {
+                const file = await fetchFile(fileId, accessToken);
+                if (file) {
+                    const parsedFile = parseFile(file);
+                    const stream = createStream(parsedFile, accessToken);
+                    if (stream) {
+                        console.log({ message: "Stream directe per ID intern", fileId });
+                        return [stream];
+                    }
+                }
+            }
+        } catch (e) {
+            console.error({ message: "Error obrint el fitxer per ID intern", fileId, error: e.toString() });
+        }
+        return [createErrorStream("No s'ha pogut obrir aquest fitxer")];
+    }
 
     // ── SÈRIES ────────────────────────────────────────────────────────────
     if (esImdb && streamRequest.season && streamRequest.episode) {
