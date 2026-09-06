@@ -33,6 +33,17 @@ const CONFIG = {
     enableSearchCatalog: true,
     enableVideoCatalog: true,
     maxFilesToFetch: 1000,
+
+    // ── Límits del pla gratuït de Cloudflare Workers ──────────────────────
+    // Free: 50 subpeticions externes per invocació (les crides a la Cache API
+    // comparteixen la mateixa quota). Per això NO podem resoldre TMDB per a
+    // totes les carpetes a cada càrrega del catàleg: resolem unes poques per
+    // petició i les desem en un mapa persistent. Al cap de 3-4 refrescs el
+    // catàleg queda complet i, a partir d'aquí, carrega instantàniament.
+    // Si passes al pla de pagament (10.000 subpeticions) pots pujar-ho molt.
+    maxResolucionsPerPeticio: 12,
+    // Durada del mapa a la memòria cau (segons). 7 dies.
+    mapaTtlSegons: 604800,
     driveQueryTerms: {
         episodeFormat: "fullText",
         titleName: "name",
@@ -81,6 +92,74 @@ const TMDB_CACHE = new Map(); // "nom_netejat" → { poster, background, imdbId,
 const SEASON_STRUCTURE_CACHE = new Map();
 // Cache de títols alternatius: imdbId → ["Dragon Ball", "Bola de Drac", ...]
 const TITLES_CACHE = new Map();
+
+// ── Pressupost de subpeticions ────────────────────────────────────────────
+// El pla gratuït permet 50 subpeticions externes per invocació. Portem el
+// compte per aturar-nos abans d'esgotar-lo i retornar sempre una resposta
+// vàlida, encara que sigui parcial, en lloc de petar amb "Too many subrequests".
+let PRESSUPOST = 50;
+function reiniciaPressupost(n = 46) { PRESSUPOST = n; }
+function consumeix(n = 1) {
+    if (PRESSUPOST - n < 0) return false;
+    PRESSUPOST -= n;
+    return true;
+}
+function quedaPressupost(minim = 3) { return PRESSUPOST > minim; }
+
+// ── Mapa persistent carpeta/fitxer → metadades ────────────────────────────
+// Tot el mapa es desa en UN sol objecte a la Cache API: llegir-lo costa una
+// única subpetició en comptes d'una per títol, que és el que feia inviable
+// resoldre el catàleg sencer dins dels límits.
+const MAPA_URL = "https://gdrive-addon.local/__mapa_v1";
+let MAPA = null;          // { [clau]: { imdbId, poster, background, title, ts } }
+let MAPA_BRUT = false;    // hi ha canvis pendents de desar?
+
+async function carregaMapa() {
+    if (MAPA) return MAPA;
+    MAPA = {};
+    try {
+        if (typeof caches === "undefined") return MAPA;
+        if (!consumeix(1)) return MAPA;
+        const resposta = await caches.default.match(new Request(MAPA_URL));
+        if (resposta) {
+            MAPA = await resposta.json();
+            console.log({ message: "Mapa carregat", entrades: Object.keys(MAPA).length });
+        }
+    } catch (e) {
+        console.error({ message: "No s'ha pogut carregar el mapa", error: e.toString() });
+    }
+    return MAPA;
+}
+
+async function desaMapa(ctx) {
+    if (!MAPA_BRUT || !MAPA) return;
+    try {
+        if (typeof caches === "undefined") return;
+        const resposta = new Response(JSON.stringify(MAPA), {
+            headers: {
+                "Content-Type": "application/json",
+                "Cache-Control": `max-age=${CONFIG.mapaTtlSegons}`,
+            },
+        });
+        const promesa = caches.default.put(new Request(MAPA_URL), resposta);
+        // waitUntil deixa que la escriptura acabi després de respondre a
+        // l'usuari: el catàleg no s'espera a que es desi el mapa.
+        if (ctx?.waitUntil) ctx.waitUntil(promesa); else await promesa;
+        MAPA_BRUT = false;
+    } catch (e) {
+        console.error({ message: "No s'ha pogut desar el mapa", error: e.toString() });
+    }
+}
+
+function llegeixMapa(clau) {
+    return MAPA?.[clau] || null;
+}
+
+function escriuMapa(clau, valor) {
+    if (!MAPA) MAPA = {};
+    MAPA[clau] = { ...valor, ts: Date.now() };
+    MAPA_BRUT = true;
+}
 
 // Limitar concurrència per no superar rate limits de TMDB (~40 req/10s)
 async function processInBatches(items, fn, batchSize = 5, delayMs = 250) {
@@ -800,8 +879,6 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
     const { queries, year } = cleanTitleForSearch(name);
     if (queries.length === 0) return null;
 
-    // Un resultat només es dona per bo si el títol s'assembla prou al que
-    // buscàvem. Això evita els "Dragon Ball" → "Dragon Ball Z" i companyia.
     const normalitza = (t) => (t || "")
         .toLowerCase()
         .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
@@ -812,84 +889,77 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
         const cand = [result.name, result.title, result.original_name, result.original_title]
             .filter(Boolean).map(normalitza);
         const q = normalitza(consulta);
-        if (cand.includes(q)) return 3;                       // coincidència exacta
+        if (cand.includes(q)) return 3;
         if (cand.some((c) => c.startsWith(q) || q.startsWith(c))) return 2;
         if (cand.some((c) => c.includes(q) || q.includes(c))) return 1;
         return 0;
     }
 
-    async function resolImdb(result) {
-        try {
-            const mediaType = result.media_type === "movie" ? "movie" : "tv";
-            const extUrl = API_ENDPOINTS.TMDB_EXTERNAL_IDS
-                .replace("{type}", mediaType)
-                .replace("{id}", result.id)
-                .replace("{apiKey}", CONFIG.tmdbApiKey);
-            const extRes = await fetch(extUrl);
-            if (extRes.ok) return (await extRes.json()).imdb_id || null;
-        } catch (e) { /* ignore */ }
-        return null;
-    }
+    try {
+        // Només UNA cerca. El paràmetre include_adult=false i language=ca-ES
+        // ja retorna els títols catalans/castellans quan existeixen, i TMDB
+        // casa prou bé els títols traduïts sense haver de provar idioma per
+        // idioma. Això baixa de ~16 subpeticions per títol a 2, que és el que
+        // fa que el catàleg càpiga dins dels límits del pla gratuït.
+        const endpoint = preferTv ? "tv" : "multi";
+        const q = queries[0];
 
-    async function cerca(endpoint, q, lang, useYear) {
-        const params = new URLSearchParams({ api_key: CONFIG.tmdbApiKey, query: q, page: "1" });
-        if (lang) params.set("language", lang);
-        if (useYear && year) params.set(endpoint === "tv" ? "first_air_date_year" : "year", year);
-        const url = `https://api.themoviedb.org/3/search/${endpoint}?${params}`;
-        const res = await fetch(url);
-        if (res.status === 429) {
-            await new Promise((r) => setTimeout(r, 1500));
+        const params = new URLSearchParams({
+            api_key: CONFIG.tmdbApiKey,
+            query: q,
+            page: "1",
+            include_adult: "false",
+            language: "ca-ES",
+        });
+        if (year) params.set(endpoint === "tv" ? "first_air_date_year" : "year", year);
+
+        if (!consumeix(1)) return null;
+        const res = await fetch(`https://api.themoviedb.org/3/search/${endpoint}?${params}`);
+        if (!res.ok) {
+            TMDB_CACHE.set(cacheKey, null);
             return null;
         }
-        if (!res.ok) return null;
         const data = await res.json();
-        return data.results || null;
-    }
+        const results = data.results || [];
 
-    try {
-        // Ordre d'endpoints: si sabem que és una sèrie, "tv" primer i multi com
-        // a últim recurs. Idiomes: català i castellà primer (els nostres noms
-        // de carpeta són en català), després global i anglès.
-        const endpoints = preferTv ? ["tv", "multi"] : ["multi", "movie", "tv"];
-        const langs = ["ca", "es", "", "en"];
-
-        let millor = null;   // { result, score }
-
-        for (const useYear of [true, false]) {
-            for (const q of queries) {
-                for (const endpoint of endpoints) {
-                    for (const lang of langs) {
-                        const results = await cerca(endpoint, q, lang, useYear);
-                        if (!results || results.length === 0) continue;
-
-                        for (const r of results.slice(0, 5)) {
-                            if (preferTv && r.media_type === "movie") continue;
-                            const mt = r.media_type || (endpoint === "tv" ? "tv" : "movie");
-                            const score = puntua(r, q);
-                            if (score === 0) continue;
-                            if (!millor || score > millor.score) {
-                                millor = { result: { ...r, media_type: mt }, score };
-                            }
-                            if (score === 3) break;
-                        }
-                        if (millor?.score === 3) break;
-                    }
-                    if (millor?.score === 3) break;
-                }
-                if (millor?.score === 3) break;
-            }
-            if (millor) break;   // ja tenim alguna cosa amb any; no repetim sense
+        let millor = null;
+        for (const r of results.slice(0, 6)) {
+            const mt = r.media_type || (endpoint === "tv" ? "tv" : "movie");
+            if (preferTv && mt === "movie") continue;
+            const score = puntua(r, q);
+            if (score === 0) continue;
+            if (!millor || score > millor.score) millor = { result: { ...r, media_type: mt }, score };
+            if (score === 3) break;
         }
-
+        // Si res no puntua però hi ha un únic resultat clar, l'acceptem
+        if (!millor && results.length > 0) {
+            const r = results[0];
+            const mt = r.media_type || (endpoint === "tv" ? "tv" : "movie");
+            if (!(preferTv && mt === "movie")) millor = { result: { ...r, media_type: mt }, score: 0 };
+        }
         if (!millor) {
             TMDB_CACHE.set(cacheKey, null);
             return null;
         }
 
         const result = millor.result;
-        const imdbId = await resolImdb(result);
+
+        // Segona i última subpetició: l'ID d'IMDB, que és el que permet que
+        // AIOMetadata aporti descripció, logo i episodis.
+        let imdbId = null;
+        if (quedaPressupost(2) && consumeix(1)) {
+            try {
+                const mediaType = result.media_type === "movie" ? "movie" : "tv";
+                const extUrl = API_ENDPOINTS.TMDB_EXTERNAL_IDS
+                    .replace("{type}", mediaType)
+                    .replace("{id}", result.id)
+                    .replace("{apiKey}", CONFIG.tmdbApiKey);
+                const extRes = await fetch(extUrl);
+                if (extRes.ok) imdbId = (await extRes.json()).imdb_id || null;
+            } catch (e) { /* ignore */ }
+        }
+
         const out = {
-            // btttr.cc no té límit de peticions; TMDB com a alternativa
             poster: imdbId
                 ? `https://btttr.cc/poster-n/imdb/poster-default/${imdbId}.jpg`
                 : (result.poster_path ? `https://image.tmdb.org/t/p/w500${result.poster_path}` : null),
@@ -905,7 +975,7 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
         TMDB_CACHE.set(cacheKey, out);
         return out;
     } catch (e) {
-        console.error({ message: "getTmdbPosterByName failed", name, error: e.toString() });
+        console.error({ message: "getTmdbPosterByName ha fallat", name, error: e.toString() });
         return null;
     }
 }
@@ -962,6 +1032,7 @@ async function getImdbSuggestionMeta(id) {
 }
 
 async function getAccessToken() {
+    consumeix(1);
     const params = new URLSearchParams({
         client_id: CREDENTIALS.clientId,
         client_secret: CREDENTIALS.clientSecret,
@@ -993,6 +1064,7 @@ async function getAccessToken() {
 }
 
 async function fetchFiles(fetchUrl, accessToken) {
+    consumeix(1);
     try {
         const response = await fetch(fetchUrl.toString(), {
             headers: { Authorization: `Bearer ${accessToken}` },
@@ -1094,6 +1166,7 @@ const FOLDER_MIME = "application/vnd.google-apps.folder";
 const VIDEO_EXT_REGEX = /\.(mkv|mp4|avi|m4v|mov|wmv|ts)$/i;
 
 async function listChildren(folderId, accessToken, { onlyFolders = false, onlyFiles = false } = {}) {
+    consumeix(1);
     let q = `'${folderId}' in parents and trashed = false`;
     if (onlyFolders) q += ` and mimeType = '${FOLDER_MIME}'`;
     if (onlyFiles) q += ` and mimeType != '${FOLDER_MIME}'`;
@@ -1138,6 +1211,12 @@ async function walkCollectionFiles(rootFolderId, accessToken, maxDepth = 6) {
 
     async function recorre(folderId, ruta, profunditat) {
         if (profunditat > maxDepth) return;
+        // Si ens quedem sense pressupost de subpeticions, parem: val més
+        // retornar els fitxers trobats fins ara que no pas fallar del tot.
+        if (!quedaPressupost(4)) {
+            console.log({ message: "Pressupost exhaurit recorrent la col·lecció", ruta });
+            return;
+        }
         const fills = await listChildren(folderId, accessToken);
         for (const item of fills) {
             if (item.mimeType === FOLDER_MIME) {
@@ -1632,6 +1711,51 @@ async function handleRequest(request) {
         if (url.pathname === "/")
             return Response.redirect(url.origin + "/manifest.json", 301);
 
+        // Escalfa el mapa: resol tants títols com permeti el pressupost i et
+        // diu quants en queden. Cridant-lo unes quantes vegades el catàleg
+        // queda complet i, a partir d'aquí, carrega a l'instant.
+        if (url.pathname === "/omplir") {
+            const accessToken = await getAccessToken();
+            if (!accessToken) return createJsonResponse({ error: "Credencials invàlides" }, 500);
+            await carregaMapa();
+
+            let resoltes = 0, pendents = 0, total = 0;
+
+            for (const rootId of CONFIG.collectionsRootFolderIds) {
+                let carpetes = [];
+                try { carpetes = await listChildren(rootId, accessToken, { onlyFolders: true }); }
+                catch (e) { continue; }
+                total += carpetes.length;
+                for (const folder of carpetes) {
+                    if (llegeixMapa("s:" + folder.id)) continue;
+                    if (!quedaPressupost(6)) { pendents++; continue; }
+                    const tmdb = await getTmdbPosterByName(folder.name, { preferTv: true });
+                    escriuMapa("s:" + folder.id, tmdb
+                        ? { imdbId: tmdb.imdbId, poster: tmdb.poster, background: tmdb.background, title: tmdb.title }
+                        : { imdbId: null, poster: null, background: null, title: null });
+                    resoltes++;
+                }
+            }
+
+            await desaMapa(null);   // aquí sí que esperem l'escriptura
+            const jaAlMapa = Object.keys(MAPA || {}).length;
+            return createJsonResponse({
+                missatge: pendents > 0
+                    ? "Encara queden títols per resoldre. Torna a carregar /omplir."
+                    : "Mapa complet.",
+                totalCarpetes: total,
+                resoltesAquestaVegada: resoltes,
+                pendents,
+                entradesAlMapa: jaAlMapa,
+            });
+        }
+
+        // Buida el mapa (per si vols refer-lo de zero)
+        if (url.pathname === "/buidar") {
+            try { await caches.default.delete(new Request(MAPA_URL)); } catch (e) {}
+            return createJsonResponse({ missatge: "Mapa esborrat." });
+        }
+
         const streamMatch = REGEX_PATTERNS.validStreamRequest.exec(
             url.pathname
         );
@@ -1667,31 +1791,32 @@ async function handleRequest(request) {
             return createProxiedStreamResponse(fileId, filename, request);
         }
 
-        const createMetaObject = async (id, name, size, thumbnail, createdTime) => {
-            const tmdb = await getTmdbPosterByName(name);
-            const useImdb = tmdb?.imdbId;
-            if (useImdb) {
-                IMDB_TO_GDRIVE.set(tmdb.imdbId, { type: "movie", id: id });
+        const createMetaObject = async (id, name, size, thumbnail, createdTime, { permetResoldre = true } = {}) => {
+            let dades = llegeixMapa("m:" + id);
+            if (!dades && permetResoldre && quedaPressupost(6)) {
+                const tmdb = await getTmdbPosterByName(name);
+                dades = tmdb
+                    ? { imdbId: tmdb.imdbId, poster: tmdb.poster, background: tmdb.background, title: tmdb.title }
+                    : { imdbId: null, poster: null, background: null, title: null };
+                escriuMapa("m:" + id, dades);
+            }
+            if (dades?.imdbId) {
+                IMDB_TO_GDRIVE.set(dades.imdbId, { type: "movie", id });
             }
             return {
-                id: useImdb ? tmdb.imdbId : `gdrive:${id}`,
-                name,
-                posterShape: "poster",
-                background: tmdb?.background || thumbnail,
-                poster: tmdb?.poster || thumbnail,
-                description:
-                    `Size: ${formatSize(size)}` +
-                    (createdTime
-                        ? ` | Created: ${new Date(createdTime).toLocaleDateString(
-                              "en-GB",
-                              {
-                                  year: "numeric",
-                                  month: "long",
-                                  day: "numeric",
-                              }
-                          )}`
-                        : ""),
+                id: dades?.imdbId ? dades.imdbId : `gdrive:${id}`,
+                name: dades?.title || name,
                 type: "movie",
+                posterShape: "poster",
+                poster: dades?.poster || thumbnail || null,
+                background: dades?.background || thumbnail || null,
+                description:
+                    `Mida: ${formatSize(size)}` +
+                    (createdTime
+                        ? ` · Afegit: ${new Date(createdTime).toLocaleDateString("ca-ES", {
+                              year: "numeric", month: "long", day: "numeric",
+                          })}`
+                        : ""),
             };
         };
 
@@ -1801,57 +1926,91 @@ async function handleRequest(request) {
                         error: "Invalid Credentials\nEnable and check the logs for more information\nClick for setup instructions",
                     });
                 }
-                const metas = [];
-                try {
-                    for (const rootId of CONFIG.collectionsRootFolderIds) {
-                        const subfolders = await listChildren(rootId, accessToken, {
-                            onlyFolders: true,
-                        });
-                        const folderMetas = await processInBatches(
-                            subfolders,
-                            async (folder) => {
-                                // preferTv: aquestes carpetes SEMPRE són sèries,
-                                // així evitem que TMDB retorni la pel·lícula
-                                // homònima (causa habitual de caràtules errònies)
-                                const tmdb = await getTmdbPosterByName(folder.name, { preferTv: true });
-                                if (tmdb?.imdbId) {
-                                    IMDB_TO_GDRIVE.set(tmdb.imdbId, { type: "series", id: folder.id });
-                                    return {
-                                        id: tmdb.imdbId,
-                                        type: "series",
-                                        // Nom net: AIOMetadata el reemplaçarà pel títol oficial
-                                        name: tmdb.title || folder.name,
-                                        posterShape: "poster",
-                                        poster: tmdb.poster || null,
-                                        background: tmdb.background || null,
-                                    };
-                                }
-                                // Fallback sense IMDB: mantenir ID custom
-                                return {
-                                    id: `gdriveshow:${folder.id}`,
-                                    type: "series",
-                                    name: folder.name,
-                                    posterShape: "poster",
-                                    poster: tmdb?.poster || null,
-                                    background: tmdb?.background || null,
-                                };
-                            },
-                            5, 200
-                        );
-                        metas.push(...folderMetas);
+                await carregaMapa();
+
+                // 1r pas: llistar carpetes (poques subpeticions)
+                const carpetes = [];
+                for (const rootId of CONFIG.collectionsRootFolderIds) {
+                    try {
+                        const subfolders = await listChildren(rootId, accessToken, { onlyFolders: true });
+                        carpetes.push(...subfolders);
+                    } catch (error) {
+                        console.error({ message: "No s'han pogut llistar les col·leccions", error: error.toString() });
                     }
-                } catch (error) {
-                    console.error({
-                        message: "Failed to list collections",
-                        error: error.toString(),
+                }
+
+                // 2n pas: separar les que ja tenim resoltes de les pendents
+                const jaResoltes = [];
+                const pendents = [];
+                for (const folder of carpetes) {
+                    const cau = llegeixMapa("s:" + folder.id);
+                    if (cau) jaResoltes.push({ folder, dades: cau });
+                    else pendents.push(folder);
+                }
+
+                // 3r pas: resoldre només un grapat de pendents per petició,
+                // mentre quedi pressupost de subpeticions
+                let resoltesAra = 0;
+                for (const folder of pendents) {
+                    if (resoltesAra >= CONFIG.maxResolucionsPerPeticio) break;
+                    if (!quedaPressupost(6)) break;
+                    const tmdb = await getTmdbPosterByName(folder.name, { preferTv: true });
+                    const dades = tmdb
+                        ? { imdbId: tmdb.imdbId, poster: tmdb.poster, background: tmdb.background, title: tmdb.title }
+                        : { imdbId: null, poster: null, background: null, title: null };
+                    escriuMapa("s:" + folder.id, dades);
+                    jaResoltes.push({ folder, dades });
+                    resoltesAra++;
+                }
+
+                // 4t pas: construir les entrades. Les que encara no s'han
+                // resolt es mostren igualment (amb el nom de la carpeta),
+                // i es resoldran en els propers refrescs.
+                const metas = [];
+                const resoltesIds = new Set(jaResoltes.map((x) => x.folder.id));
+                for (const { folder, dades } of jaResoltes) {
+                    if (dades.imdbId) {
+                        IMDB_TO_GDRIVE.set(dades.imdbId, { type: "series", id: folder.id });
+                        metas.push({
+                            id: dades.imdbId,
+                            type: "series",
+                            name: dades.title || folder.name,
+                            posterShape: "poster",
+                            poster: dades.poster || null,
+                            background: dades.background || null,
+                        });
+                    } else {
+                        metas.push({
+                            id: `gdriveshow:${folder.id}`,
+                            type: "series",
+                            name: folder.name,
+                            posterShape: "poster",
+                            poster: dades.poster || null,
+                            background: dades.background || null,
+                        });
+                    }
+                }
+                for (const folder of carpetes) {
+                    if (resoltesIds.has(folder.id)) continue;
+                    metas.push({
+                        id: `gdriveshow:${folder.id}`,
+                        type: "series",
+                        name: folder.name,
+                        posterShape: "poster",
                     });
                 }
+
                 const metasFinals = dedupMetas(metas);
                 console.log({
-                    message: "Collections catalog response",
-                    numCarpetes: metas.length,
-                    numMetas: metasFinals.length,
+                    message: "Catàleg de col·leccions",
+                    carpetes: carpetes.length,
+                    jaAlMapa: carpetes.length - pendents.length,
+                    resoltesAra,
+                    pendents: pendents.length - resoltesAra,
+                    metas: metasFinals.length,
+                    pressupostRestant: PRESSUPOST,
                 });
+                await desaMapa(globalThis.__ctx);
                 return createJsonResponse({ metas: metasFinals });
             }
 
@@ -1891,19 +2050,30 @@ async function handleRequest(request) {
                 }
 
                 const results = await fetchFiles(fetchUrl, accessToken);
-                const totsMetas = await processInBatches(
-                    results.files,
-                    (file) => createMetaObject(
-                        file.id, file.name, file.size, file.thumbnailLink, file.createdTime
-                    ),
-                    5, 200
-                );
+                await carregaMapa();
+
+                let resoltesAra = 0;
+                const totsMetas = [];
+                for (const file of results.files) {
+                    const potResoldre =
+                        resoltesAra < CONFIG.maxResolucionsPerPeticio && quedaPressupost(6);
+                    const abans = PRESSUPOST;
+                    totsMetas.push(await createMetaObject(
+                        file.id, file.name, file.size, file.thumbnailLink, file.createdTime,
+                        { permetResoldre: potResoldre }
+                    ));
+                    if (PRESSUPOST < abans) resoltesAra++;
+                }
+
                 const metas = dedupMetas(totsMetas);
                 console.log({
-                    message: "Catalog response",
-                    numFitxers: results.files.length,
-                    numMetas: metas.length,
+                    message: "Catàleg de pel·lícules",
+                    fitxers: results.files.length,
+                    resoltesAra,
+                    metas: metas.length,
+                    pressupostRestant: PRESSUPOST,
                 });
+                await desaMapa(globalThis.__ctx);
                 return createJsonResponse({ metas });
             }
 
@@ -1938,14 +2108,21 @@ async function handleRequest(request) {
                     return createJsonResponse({ metas: [] });
                 }
 
-                const totsMetas = await processInBatches(
-                    results.files,
-                    (file) => createMetaObject(
-                        file.id, file.name, file.size, file.thumbnailLink, file.createdTime
-                    ),
-                    5, 200
-                );
+                await carregaMapa();
+                let resoltesAra = 0;
+                const totsMetas = [];
+                for (const file of results.files.slice(0, 60)) {
+                    const potResoldre =
+                        resoltesAra < CONFIG.maxResolucionsPerPeticio && quedaPressupost(6);
+                    const abans = PRESSUPOST;
+                    totsMetas.push(await createMetaObject(
+                        file.id, file.name, file.size, file.thumbnailLink, file.createdTime,
+                        { permetResoldre: potResoldre }
+                    ));
+                    if (PRESSUPOST < abans) resoltesAra++;
+                }
                 const metas = dedupMetas(totsMetas);
+                await desaMapa(globalThis.__ctx);
 
                 return createJsonResponse({ metas });
             }
@@ -2382,6 +2559,14 @@ export default {
         CREDENTIALS.refreshToken =
             CREDENTIALS.refreshToken || env.REFRESH_TOKEN;
         CONFIG.tmdbApiKey = CONFIG.tmdbApiKey || env.TMDB_API_KEY;
+
+        // Cada invocació parteix del pressupost de subpeticions del pla
+        // gratuït (50). En deixem 4 de marge per als imprevistos.
+        reiniciaPressupost(46);
+        MAPA = null;
+        MAPA_BRUT = false;
+        globalThis.__ctx = ctx;
+
         return handleRequest(request);
     },
 };
