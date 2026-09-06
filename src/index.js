@@ -73,7 +73,7 @@ const CONFIG = {
 
 // Identificador de la versió del codi. Serveix per verificar via /versio
 // quina versió s'està executant realment al worker.
-const VERSIO_CODI = "2026-09-06.extres-omesos+cau-recorregut";
+const VERSIO_CODI = "2026-09-06.carpeta-exacta+filtre-extres";
 
 const MANIFEST = {
     id: "stremio.gdrive.worker.cat",
@@ -1747,6 +1747,42 @@ const CARPETES_NO_EPISODIS = new RegExp(
     "i"
 );
 
+// Fitxers que són dins la carpeta de la sèrie però NO són episodis:
+// openings, endings, OVAs, pel·lícules, tràilers. Sense aquest filtre, un
+// "OP1.mkv" o un "OVA 01.mkv" es comptava com a episodi 1 i apareixia com a
+// opció d'un episodi que no li corresponia.
+//
+// Regla de seguretat: si el nom porta una marca EXPLÍCITA de temporada i
+// episodi (S01E05, T1xC05, 1x05), és un episodi i no s'exclou mai. Això
+// evita descartar episodis amb títols com "L'obertura del torneig".
+function esFitxerNoEpisodi(nom) {
+    const base = nom.replace(/\.[a-z0-9]{2,4}$/i, "").trim();
+
+    if (SXE_REGEX.test(base) || TXC_REGEX.test(base) || NXM_REGEX.test(base)
+        || TEMPORADA_EP_REGEX.test(base)) {
+        return false;
+    }
+
+    const net = base.replace(/\[.*?\]/g, " ").replace(/\s+/g, " ").trim();
+
+    // Noms que consisteixen NOMÉS en la marca: "OP", "NCED2", "ED 03"
+    if (/^(?:nc)?(?:op|ed)\s*\d*$/i.test(net)) return true;
+
+    // Comencen per la marca: "OVA 01 - …", "Opening 2", "Pel·lícula 03 - …"
+    if (/^(?:ova|oav|ona)\b/i.test(net)) return true;
+    if (/^(?:opening|ending|obertura|tancament)\b/i.test(net)) return true;
+    if (/^(?:pel[·.]?l[íi]cula|pelicula|movie|film)\b/i.test(net)) return true;
+    if (/^(?:trailer|tr[àa]iler|teaser|promo|preview|pv|cm)\b/i.test(net)) return true;
+    if (/^(?:nc)?(?:op|ed)\s*\d+\b/i.test(net)) return true;
+
+    // La marca com a paraula solta en qualsevol posició
+    if (/\b(?:ncop|nced)\b/i.test(net)) return true;
+    if (/\b(?:opening|ending)\s*\d+\b/i.test(net)) return true;
+    if (/\bova\s*\d+\b/i.test(net)) return true;
+
+    return false;
+}
+
 function esCarpetaDExtres(nom) {
     if (CARPETES_NO_EPISODIS.test(nom)) return true;
     // Comença per la paraula: "Extres i coses", "Music Collection"…
@@ -1800,6 +1836,7 @@ async function walkCollectionFiles(rootFolderId, accessToken, maxDepth = 6) {
 
     const resultats = [];
     const saltades = [];
+    const fitxersOmesos = [];
     let complet = true;
 
     async function recorre(folderId, ruta, profunditat) {
@@ -1818,6 +1855,10 @@ async function walkCollectionFiles(rootFolderId, accessToken, maxDepth = 6) {
                 }
                 await recorre(item.id, [...ruta, item.name], profunditat + 1);
             } else if (VIDEO_EXT_REGEX.test(item.name)) {
+                if (esFitxerNoEpisodi(item.name)) {
+                    fitxersOmesos.push(item.name);
+                    continue;
+                }
                 resultats.push({ file: item, ruta: [...ruta, item.name] });
             }
         }
@@ -1826,6 +1867,10 @@ async function walkCollectionFiles(rootFolderId, accessToken, maxDepth = 6) {
     await recorre(rootFolderId, [], 0);
     if (saltades.length) {
         console.log({ message: "Carpetes d'extres omeses", saltades: saltades.slice(0, 12) });
+    }
+    if (fitxersOmesos.length) {
+        console.log({ message: "Fitxers que no són episodis, omesos",
+                      quants: fitxersOmesos.length, mostra: fitxersOmesos.slice(0, 8) });
     }
     // Només desem el recorregut si ha estat COMPLET. Desar-ne un de truncat
     // congelaria una llista incompleta durant tot un dia.
@@ -3027,7 +3072,7 @@ async function findCollectionFolder(imdbId, accessToken) {
     if (titles.length === 0) return null;
     const titlesNorm = titles.map(normalitzaTitol).filter(Boolean);
 
-    let millor = null; // { id, score }
+    const candidats = new Map(); // folderId → { id, nom, score }
 
     for (const rootId of CONFIG.collectionsRootFolderIds) {
         let subfolders;
@@ -3045,18 +3090,47 @@ async function findCollectionFolder(imdbId, accessToken) {
                 if (folderNorm === t) score = 3;
                 else if (folderNorm.startsWith(t) || t.startsWith(folderNorm)) score = 2;
                 else if (folderNorm.includes(t) || t.includes(folderNorm)) score = 1;
-                if (score > 0 && (!millor || score > millor.score)) {
-                    millor = { id: folder.id, nom: folder.name, score };
+                if (score > 0) {
+                    const previ = candidats.get(folder.id);
+                    if (!previ || score > previ.score) {
+                        candidats.set(folder.id, { id: folder.id, nom: folder.name, score });
+                    }
                 }
             }
         }
     }
 
-    if (millor) {
-        IMDB_TO_GDRIVE.set(imdbId, { type: "series", id: millor.id });
-        console.log({ message: "Carpeta trobada per títol", imdbId, carpeta: millor.nom, score: millor.score });
-        return [millor.id];
+    const llista = [...candidats.values()];
+    if (llista.length === 0) return [];
+
+    // Una coincidència EXACTA mana sobre qualsevol parcial. És el que
+    // distingeix "Inazuma Eleven" de "Inazuma Eleven GO": amb coincidència
+    // per prefix, cada títol encaixava amb la carpeta de l'altre i guanyava
+    // la primera que es trobés, de manera que les dues sèries donaven els
+    // mateixos episodis.
+    const exactes = llista.filter((c) => c.score === 3);
+    if (exactes.length) {
+        IMDB_TO_GDRIVE.set(imdbId, { type: "series", id: exactes[0].id });
+        console.log({ message: "Carpeta trobada (exacta)", imdbId, carpeta: exactes[0].nom });
+        return exactes.map((c) => c.id);
     }
+
+    // Sense coincidència exacta, només acceptem una coincidència parcial si
+    // NO és ambigua. Amb diverses candidates val més no retornar res que
+    // servir els episodis d'una altra sèrie.
+    const millorPunt = Math.max(...llista.map((c) => c.score));
+    const millors = llista.filter((c) => c.score === millorPunt);
+    if (millors.length === 1) {
+        IMDB_TO_GDRIVE.set(imdbId, { type: "series", id: millors[0].id });
+        console.log({ message: "Carpeta trobada (parcial)", imdbId, carpeta: millors[0].nom, score: millorPunt });
+        return [millors[0].id];
+    }
+
+    console.log({
+        message: "Coincidència ambigua: no s'assigna cap carpeta",
+        imdbId,
+        candidates: millors.map((c) => c.nom).slice(0, 5),
+    });
     return [];
 }
 

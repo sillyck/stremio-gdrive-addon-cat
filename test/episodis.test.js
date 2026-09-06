@@ -133,6 +133,22 @@ console.log("\n── Exclusió de carpetes d'extres (cas real d'El Detectiu Con
   prova(`${recorre.length} carpetes d'episodis es recorren`, recorre.every((n) => !esExtra(n)));
 }
 
+console.log("\n── Fitxers que no són episodis (openings, OVAs, pel·lícules)");
+{
+  const noEp = ctx.esFitxerNoEpisodi;
+  const fora = ["OP1.mkv","NCOP.mkv","NCED2.mkv","ED 03.mkv","Opening 2.mkv","Ending 1.mkv",
+                "OVA 01 - El tresor perdut.mkv","OVA1.mkv","Pel·lícula 03.mkv","Movie 1.mkv",
+                "Trailer.mkv","PV 2.mp4","Obertura.mkv"];
+  // Casos delicats: episodis reals amb paraules que semblen marques d'extra
+  const dins = ["Death Note S01×E28.mkv","T1xC11 El justificant.mkv",
+                "One Piece - 01x01 - Yo soy Luffy.mkv","Bola de Drac - 031 - El Gran Torneig.mkv",
+                "FMAB 01 v2.mkv","Bobobo 01 by ackman.mkv",
+                "Capitol 12 - L obertura del torneig.mkv","S02E05 - Opening Act.mkv",
+                "045 - La pel·lícula que van rodar.mkv"];
+  prova(`${fora.length} extres s'ometen`, fora.every(noEp));
+  prova(`${dins.length} episodis reals es mantenen`, dins.every((n) => !noEp(n)));
+}
+
 console.log("\n"+"═".repeat(72));
 console.log(fall===0 ? `TOTES LES ${total} PROVES PASSEN` : `${fall} de ${total} PROVES FALLEN`);
 process.exit(fall?1:0);
