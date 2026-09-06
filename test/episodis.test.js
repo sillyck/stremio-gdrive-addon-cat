@@ -161,6 +161,25 @@ console.log("\n── Filtre d'extres amb les carpetes reals de Bola de Drac");
   prova(`${dins.length} carpetes d'episodis reals es recorren`, dins.every((n) => !ex(n)));
 }
 
+console.log("\n── Temporades del Drive desalineades amb les de TMDB (cas Inazuma Eleven)");
+{
+  // 141 fitxers numerats T1..T3 al Drive; TMDB en compta 4 temporades.
+  const fs = [];
+  for (let c = 1; c <= 50; c++) fs.push(f([`Serie T1xC${String(c).padStart(2,"0")}.mkv`]));
+  for (let c = 1; c <= 50; c++) fs.push(f([`Serie T2xC${String(c).padStart(2,"0")}.mkv`]));
+  for (let c = 1; c <= 41; c++) fs.push(f([`Serie T3xC${String(c).padStart(2,"0")}.mkv`]));
+  const est = [undefined, 40, 40, 40, 21];
+  const un = (s, e) => {
+    const r = trobaEpisodis(fs, s, e, est);
+    return r.matches.length === 1 ? r.matches[0].nomArxiu : null;
+  };
+  prova("la coincidència exacta mana quan existeix", un(2,45)?.includes("T2xC45"));
+  prova("S4E1 (temporada inexistent al Drive) → absolut 121", un(4,1)?.includes("T3xC21"));
+  prova("S4E7 → absolut 127", un(4,7)?.includes("T3xC27"));
+  prova("S4E21 → absolut 141, l'últim", un(4,21)?.includes("T3xC41"));
+  prova("fora de rang no retorna res", un(4,22) === null && un(9,1) === null);
+}
+
 console.log("\n"+"═".repeat(72));
 console.log(fall===0 ? `TOTES LES ${total} PROVES PASSEN` : `${fall} de ${total} PROVES FALLEN`);
 process.exit(fall?1:0);

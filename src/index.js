@@ -81,7 +81,7 @@ const CONFIG = {
 
 // Identificador de la versió del codi. Serveix per verificar via /versio
 // quina versió s'està executant realment al worker.
-const VERSIO_CODI = "2026-09-06.multicarpeta";
+const VERSIO_CODI = "2026-09-06.temporades-desalineades";
 
 const MANIFEST = {
     id: "stremio.gdrive.worker.cat",
@@ -2141,7 +2141,43 @@ function trobaEpisodis(fitxersRuta, targetSeason, targetEpisode, estructura) {
         const m = items.filter(
             (i) => i.season === targetSeason && i.episode === targetEpisode
         );
-        return { matches: m, estrategia: esquema, esquema };
+        if (m.length) return { matches: m, estrategia: esquema, esquema };
+
+        // Reserva: les temporades del Drive poden no coincidir amb les de
+        // TMDB. És habitual als animes, on una mateixa emissió es reparteix
+        // en temporades diferents segons la font: els fitxers van T1..T3 i
+        // TMDB en compta 4, o l'episodi 69 de TMDB és el T2xC17 del Drive.
+        // Quan la coincidència exacta falla, ordenem tots els fitxers per
+        // (temporada, episodi) i busquem per posició absoluta.
+        const absolut = aAbsolut(targetSeason, targetEpisode, estructura);
+        if (absolut != null) {
+            const ordenats = items
+                .filter((i) => i.episode != null)
+                .sort((a, b) => (a.season ?? 0) - (b.season ?? 0) || a.episode - b.episode);
+
+            // Agrupem per clau (temporada:episodi) perquè les diverses
+            // qualitats d'un mateix episodi comptin com una sola posició.
+            const grups = [];
+            const vistos = new Map();
+            for (const it of ordenats) {
+                const clau = `${it.season ?? "-"}:${it.episode}`;
+                if (!vistos.has(clau)) {
+                    vistos.set(clau, grups.length);
+                    grups.push([it]);
+                } else {
+                    grups[vistos.get(clau)].push(it);
+                }
+            }
+
+            if (absolut >= 1 && absolut <= grups.length) {
+                return {
+                    matches: grups[absolut - 1],
+                    estrategia: esquema + "→absolut",
+                    esquema,
+                };
+            }
+        }
+        return { matches: [], estrategia: esquema, esquema };
     }
 
     // 2. La temporada ve de la carpeta contenidora
