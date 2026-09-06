@@ -221,6 +221,47 @@ console.log("\n── Sèries germanes dins d'un contenidor de franquícia");
   if (fallats.length) console.log("      fallats:", fallats.map((x) => x[0]).join(", "));
 }
 
+console.log("\n── Tria de subcarpeta dins un contenidor de franquícia");
+{
+  const subs = [
+    { id:"S_DB",  name:"Bola de Drac [cat jap] [Albert Wesker]" },
+    { id:"S_Z",   name:"Bola de Drac Z [cat jap] [Albert Wesker]" },
+    { id:"S_GT",  name:"Bola de Drac GT [cat jap] [Albert Wesker]" },
+    { id:"S_KAI", name:"Bola de Drac Z Kai - Els Capítols Finals [cat]" },
+    { id:"S_OST", name:"OSTs" },
+  ];
+  // Reprodueix la tria sense tocar la xarxa
+  const tria = (titols) => {
+    const tn = titols.map(ctx.normalitzaTitol);
+    const cands = [];
+    for (const sub of subs) {
+      if (ctx.esCarpetaDExtres(sub.name)) continue;
+      const nets = ctx.cleanTitleForSearch(sub.name);
+      const variants = new Set([...nets.queries, sub.name]
+        .filter((q) => q !== nets.curt).map(ctx.normalitzaTitol).filter(Boolean));
+      let millor = null;
+      for (const t of tn) if (variants.has(t) && (!millor || t.length > millor.length)) millor = t;
+      if (millor) cands.push({ sub, titol: millor });
+    }
+    if (!cands.length) return "ROOT";
+    const max = Math.max(...cands.map((c) => c.titol.length));
+    const m = cands.filter((c) => c.titol.length === max);
+    return m.length === 1 ? m[0].sub.id : "ROOT";
+  };
+  const casos = [
+    [["Dragon Ball","Bola de Drac"], "S_DB"],
+    [["Dragon Ball Z","Bola de Drac Z"], "S_Z"],
+    [["Dragon Ball Z","Bola de Drac Z","Bola de Drac"], "S_Z"],
+    [["Dragon Ball GT","Bola de Drac GT"], "S_GT"],
+    [["Dragon Ball Z Kai","Bola de Drac Z Kai - Els Capítols Finals"], "S_KAI"],
+    [["Dragon Ball Z Kai","Bola de Drac Z Kai"], "S_KAI"],
+    [["Bleach"], "ROOT"],
+  ];
+  const mal = casos.filter(([t, esp]) => tria(t) !== esp);
+  prova(`${casos.length} sèries de la franquícia van a la seva subcarpeta`, mal.length === 0);
+  if (mal.length) console.log("      fallats:", JSON.stringify(mal.map((x) => x[0])));
+}
+
 console.log("\n"+"═".repeat(72));
 console.log(fall===0 ? `TOTES LES ${total} PROVES PASSEN` : `${fall} de ${total} PROVES FALLEN`);
 process.exit(fall?1:0);

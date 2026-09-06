@@ -81,7 +81,7 @@ const CONFIG = {
 
 // Identificador de la versió del codi. Serveix per verificar via /versio
 // quina versió s'està executant realment al worker.
-const VERSIO_CODI = "2026-09-06.series-germanes";
+const VERSIO_CODI = "2026-09-06.subcarpeta-titol-mes-llarg";
 
 const MANIFEST = {
     id: "stremio.gdrive.worker.cat",
@@ -957,11 +957,19 @@ function cleanTitleForSearch(name) {
     afegeix(cleanedName);
 
     // Candidat curt: les 3 primeres paraules. Rescata títols llargs amb
-    // subtítol enganxat sense cap separador reconegut.
+    // subtítol enganxat sense cap separador reconegut, i és útil per cercar
+    // a TMDB. En canvi NO serveix per comparar noms de carpeta, perquè
+    // escapça precisament allò que distingeix dues sèries germanes
+    // ("Bola de Drac Z" quedaria reduït a "Bola de Drac"). Per això el
+    // retornem marcat a part, perquè qui compari carpetes el pugui excloure.
     const paraules = cleanedName.split(/\s+/);
-    if (paraules.length > 3) afegeix(paraules.slice(0, 3).join(" "));
+    let curt = null;
+    if (paraules.length > 3) {
+        curt = paraules.slice(0, 3).join(" ");
+        afegeix(curt);
+    }
 
-    return { queries: candidats, year };
+    return { queries: candidats, year, curt };
 }
 
 // ── Resolució de títols en català ─────────────────────────────────────────
@@ -1871,7 +1879,9 @@ const MARQUES_DIVISIO = new Set([
 // "One Piece [501-1000]"  → part (un cop netejat és idèntic al títol)
 function esSerieGermana(nomCarpeta, titolsNorm) {
     if (!titolsNorm?.length) return false;
-    const net = normalitzaTitol(cleanTitleForSearch(nomCarpeta).queries[0] || nomCarpeta);
+    const netsG = cleanTitleForSearch(nomCarpeta);
+    const utilsG = netsG.queries.filter((q) => q !== netsG.curt);
+    const net = normalitzaTitol(utilsG[0] || nomCarpeta);
     if (!net) return false;
 
     for (const t of titolsNorm) {
@@ -1906,20 +1916,58 @@ async function afinaCarpetaDeSerie(rootFolderId, titols, accessToken) {
     if (subcarpetes.length < 2) return rootFolderId;
 
     const titolsNorm = titols.map(normalitzaTitol).filter(Boolean);
-    const exactes = [];
+
+    // Per cada subcarpeta, quin és el títol MÉS LLARG amb què coincideix
+    // exactament. La longitud desempata: buscant "Bola de Drac Z", la
+    // subcarpeta "Bola de Drac Z" guanya la subcarpeta "Bola de Drac",
+    // encara que totes dues coincideixin amb algun dels títols coneguts.
+    const candidats = [];
     for (const sub of subcarpetes) {
         if (esCarpetaDExtres(sub.name)) continue;
-        const net = cleanTitleForSearch(sub.name).queries[0] || sub.name;
-        if (titolsNorm.includes(normalitzaTitol(net))) exactes.push(sub);
+        // Comparem contra TOTES les variants netejades del nom de la carpeta.
+        // "Bola de Drac Z Kai - Els Capítols Finals" genera tant la versió
+        // tallada pel guió com la sencera, i el títol oficial pot ser
+        // qualsevol de les dues.
+        const nets = cleanTitleForSearch(sub.name);
+        const variants = new Set(
+            [...nets.queries, sub.name]
+                .filter((q) => q !== nets.curt)     // el curt escapça títols
+                .map(normalitzaTitol)
+                .filter(Boolean)
+        );
+        let millorTitol = null;
+        for (const t of titolsNorm) {
+            if (variants.has(t) && (!millorTitol || t.length > millorTitol.length)) millorTitol = t;
+        }
+        if (millorTitol) candidats.push({ sub, titol: millorTitol });
     }
 
-    if (exactes.length === 1) {
+    if (candidats.length === 0) {
+        console.log({
+            message: "Cap subcarpeta coincideix exactament: recorro l'arrel",
+            arrel: rootFolderId,
+            titols: titolsNorm.slice(0, 4),
+            subcarpetes: subcarpetes.map((x) => x.name).slice(0, 10),
+        });
+        return rootFolderId;
+    }
+
+    const maxLong = Math.max(...candidats.map((c) => c.titol.length));
+    const millors = candidats.filter((c) => c.titol.length === maxLong);
+
+    if (millors.length === 1) {
         console.log({
             message: "Contenidor de franquícia: baixo a la subcarpeta exacta",
-            arrel: rootFolderId, subcarpeta: exactes[0].name,
+            arrel: rootFolderId, subcarpeta: millors[0].sub.name, titol: millors[0].titol,
         });
-        return exactes[0].id;
+        return millors[0].sub.id;
     }
+
+    console.log({
+        message: "Diverses subcarpetes coincideixen igual de bé: recorro l'arrel",
+        arrel: rootFolderId,
+        empatades: millors.map((c) => c.sub.name).slice(0, 5),
+    });
     return rootFolderId;
 }
 
@@ -3279,7 +3327,8 @@ async function findCollectionFolder(imdbId, accessToken) {
     const exactes = llista.filter((c) => c.score === 3);
     if (exactes.length) {
         IMDB_TO_GDRIVE.set(imdbId, { type: "series", ids: exactes.map((c) => c.id) });
-        console.log({ message: "Carpeta trobada (exacta)", imdbId, carpeta: exactes[0].nom });
+        console.log({ message: "Carpeta trobada (exacta)", imdbId, carpeta: exactes[0].nom,
+                      folderId: exactes[0].id });
         return exactes.map((c) => c.id);
     }
 
@@ -3290,7 +3339,9 @@ async function findCollectionFolder(imdbId, accessToken) {
     const millors = llista.filter((c) => c.score === millorPunt);
     if (millors.length === 1) {
         IMDB_TO_GDRIVE.set(imdbId, { type: "series", ids: [millors[0].id] });
-        console.log({ message: "Carpeta trobada (parcial)", imdbId, carpeta: millors[0].nom, score: millorPunt });
+        console.log({ message: "Carpeta trobada (parcial)", imdbId, carpeta: millors[0].nom,
+                      folderId: millors[0].id, score: millorPunt,
+                      titols: (await getTitolsAlternatius(imdbId, "series")).slice(0, 4) });
         return [millors[0].id];
     }
 
