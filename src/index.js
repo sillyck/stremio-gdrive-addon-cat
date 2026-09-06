@@ -1806,32 +1806,162 @@ async function createProxiedStreamResponse(fileId, filename, request) {
     }
 }
 
+async function findCollectionFolder(imdbId, accessToken) {
+    // 1. Comprovar cache en memòria primer
+    if (IMDB_TO_GDRIVE.has(imdbId)) {
+        const mapping = IMDB_TO_GDRIVE.get(imdbId);
+        if (mapping.type === "series") return mapping.id;
+    }
+
+    // 2. Obtenir títols (anglès via Cinemeta + cerca TMDB per variants)
+    let titles = [];
+    try {
+        const meta = await getCinemetaMeta("series", imdbId);
+        if (meta?.name) titles.push(meta.name);
+    } catch (e) { /* ignore */ }
+
+    // Obtenir títol en català/castellà via TMDB
+    if (CONFIG.tmdbApiKey) {
+        try {
+            const tmdbMeta = await getTmdbMeta("series", imdbId);
+            if (tmdbMeta?.name && !titles.includes(tmdbMeta.name)) titles.push(tmdbMeta.name);
+        } catch (e) { /* ignore */ }
+
+        // Buscar títols alternatius en ca i es
+        const findUrl = API_ENDPOINTS.TMDB_FIND
+            .replace("{id}", imdbId)
+            .replace("{apiKey}", CONFIG.tmdbApiKey);
+        for (const lang of ["ca", "es"]) {
+            try {
+                const res = await fetch(findUrl + `&language=${lang}`);
+                if (res.ok) {
+                    const data = await res.json();
+                    const result = data.tv_results?.[0] || data.movie_results?.[0];
+                    if (result) {
+                        const name = result.name || result.title;
+                        if (name && !titles.includes(name)) titles.push(name);
+                    }
+                }
+            } catch (e) { /* ignore */ }
+        }
+    }
+
+    if (titles.length === 0) return null;
+
+    // 3. Buscar la carpeta que coincideixi dins les collectionsRootFolderIds
+    for (const rootId of CONFIG.collectionsRootFolderIds) {
+        const subfolders = await listChildren(rootId, accessToken, { onlyFolders: true });
+        for (const folder of subfolders) {
+            const folderClean = cleanTitleForSearch(folder.name).queries[0]?.toLowerCase() || folder.name.toLowerCase();
+            for (const title of titles) {
+                const titleClean = title.toLowerCase();
+                if (folderClean.includes(titleClean) || titleClean.includes(folderClean)) {
+                    // Guardar al mapping per futures crides
+                    IMDB_TO_GDRIVE.set(imdbId, { type: "series", id: folder.id });
+                    console.log({ message: "Found collection folder", imdbId, folderName: folder.name, matchedTitle: title });
+                    return folder.id;
+                }
+            }
+        }
+    }
+    return null;
+}
+
+async function findMovieFile(imdbId, accessToken) {
+    // 1. Comprovar cache en memòria primer
+    if (IMDB_TO_GDRIVE.has(imdbId)) {
+        const mapping = IMDB_TO_GDRIVE.get(imdbId);
+        if (mapping.type === "movie") return mapping.id;
+    }
+
+    // 2. Obtenir títols
+    let titles = [];
+    try {
+        const meta = await getCinemetaMeta("movie", imdbId);
+        if (meta?.name) titles.push(meta.name);
+    } catch (e) { /* ignore */ }
+
+    if (CONFIG.tmdbApiKey) {
+        try {
+            const tmdbMeta = await getTmdbMeta("movie", imdbId);
+            if (tmdbMeta?.name && !titles.includes(tmdbMeta.name)) titles.push(tmdbMeta.name);
+        } catch (e) { /* ignore */ }
+
+        const findUrl = API_ENDPOINTS.TMDB_FIND
+            .replace("{id}", imdbId)
+            .replace("{apiKey}", CONFIG.tmdbApiKey);
+        for (const lang of ["ca", "es"]) {
+            try {
+                const res = await fetch(findUrl + `&language=${lang}`);
+                if (res.ok) {
+                    const data = await res.json();
+                    const result = data.movie_results?.[0];
+                    if (result) {
+                        const name = result.title || result.name;
+                        if (name && !titles.includes(name)) titles.push(name);
+                    }
+                }
+            } catch (e) { /* ignore */ }
+        }
+    }
+
+    if (titles.length === 0) return null;
+
+    // 3. Buscar el fitxer dins moviesFolderIds
+    const movieFolderIds = CONFIG.moviesFolderIds?.length > 0 ? CONFIG.moviesFolderIds : CONFIG.driveFolderIds;
+    if (!movieFolderIds?.length) return null;
+
+    for (const folderId of movieFolderIds) {
+        for (const title of titles) {
+            const q = `'${folderId}' in parents and trashed=false and mimeType contains 'video/' and name contains '${title.replace(/'/g, "\\\\'")}'`;
+            const fetchUrl = new URL(API_ENDPOINTS.DRIVE_FETCH_FILES);
+            fetchUrl.search = new URLSearchParams({
+                q, corpora: "allDrives", includeItemsFromAllDrives: "true",
+                supportsAllDrives: "true", pageSize: "10",
+                fields: "files(id,name,size,videoMediaMetadata,mimeType,fileExtension)",
+            }).toString();
+            try {
+                const results = await fetchFiles(fetchUrl, accessToken);
+                if (results?.files?.length > 0) {
+                    const fileId = results.files[0].id;
+                    IMDB_TO_GDRIVE.set(imdbId, { type: "movie", id: fileId });
+                    console.log({ message: "Found movie file", imdbId, fileName: results.files[0].name, matchedTitle: title });
+                    return fileId;
+                }
+            } catch (e) { /* ignore */ }
+        }
+    }
+    return null;
+}
+
 async function getStreams(streamRequest) {
     const streams = [];
     const imdbId = streamRequest.id.split(":")[0];
 
-    // Comprovar si tenim un mapping directe IMDB → carpeta GDrive (collections)
-    const mapping = IMDB_TO_GDRIVE.get(imdbId);
-    if (mapping && mapping.type === "series" && streamRequest.season && streamRequest.episode) {
+    // SÈRIES: buscar carpeta de la col·lecció i caminar-la
+    if (streamRequest.season && streamRequest.episode) {
         try {
             const accessToken = await getAccessToken();
             if (accessToken) {
-                const fitxersRuta = await walkCollectionFiles(mapping.id, accessToken);
-                const episodis = assignaEpisodis(fitxersRuta);
-                const targetSeason = parseInt(streamRequest.season, 10);
-                const targetEpisode = parseInt(streamRequest.episode, 10);
-                const matches = episodis.filter(
-                    (ep) => ep.season === targetSeason && ep.episode === targetEpisode
-                );
-                for (const match of matches) {
-                    const file = match.file;
-                    const parsedFile = parseFile(file);
-                    const stream = createStream(parsedFile, accessToken);
-                    if (stream) streams.push(stream);
-                }
-                if (streams.length > 0) {
-                    console.log({ message: "Found streams via collection mapping", imdbId, season: targetSeason, episode: targetEpisode, count: streams.length });
-                    return streams;
+                const folderId = await findCollectionFolder(imdbId, accessToken);
+                if (folderId) {
+                    const fitxersRuta = await walkCollectionFiles(folderId, accessToken);
+                    const episodis = assignaEpisodis(fitxersRuta);
+                    const targetSeason = parseInt(streamRequest.season, 10);
+                    const targetEpisode = parseInt(streamRequest.episode, 10);
+                    const matches = episodis.filter(
+                        (ep) => ep.season === targetSeason && ep.episode === targetEpisode
+                    );
+                    for (const match of matches) {
+                        const file = match.file;
+                        const parsedFile = parseFile(file);
+                        const stream = createStream(parsedFile, accessToken);
+                        if (stream) streams.push(stream);
+                    }
+                    if (streams.length > 0) {
+                        console.log({ message: "Found streams via collection folder", imdbId, season: targetSeason, episode: targetEpisode, count: streams.length });
+                        return streams;
+                    }
                 }
             }
         } catch (e) {
@@ -1839,18 +1969,21 @@ async function getStreams(streamRequest) {
         }
     }
 
-    // Comprovar si tenim un mapping directe IMDB → fitxer GDrive (pelis)
-    if (mapping && mapping.type === "movie") {
+    // PEL·LÍCULES: buscar fitxer directe
+    if (!streamRequest.season && !streamRequest.episode) {
         try {
             const accessToken = await getAccessToken();
             if (accessToken) {
-                const file = await fetchFile(mapping.id, accessToken);
-                if (file) {
-                    const parsedFile = parseFile(file);
-                    const stream = createStream(parsedFile, accessToken);
-                    if (stream) {
-                        console.log({ message: "Found stream via movie mapping", imdbId, fileId: mapping.id });
-                        return [stream];
+                const fileId = await findMovieFile(imdbId, accessToken);
+                if (fileId) {
+                    const file = await fetchFile(fileId, accessToken);
+                    if (file) {
+                        const parsedFile = parseFile(file);
+                        const stream = createStream(parsedFile, accessToken);
+                        if (stream) {
+                            console.log({ message: "Found stream via movie lookup", imdbId, fileId });
+                            return [stream];
+                        }
                     }
                 }
             }
@@ -1861,7 +1994,7 @@ async function getStreams(streamRequest) {
 
     // Fallback: cerca per títol a Google Drive (comportament original)
     const query = await buildSearchQuery(streamRequest);
-    console.log({ message: "Built search query", query, config: CONFIG });
+    console.log({ message: "Built search query (fallback)", query, config: CONFIG });
 
     const queryParams = {
         q: query,
