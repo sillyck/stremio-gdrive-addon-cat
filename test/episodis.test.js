@@ -178,6 +178,16 @@ console.log("\n── Temporades del Drive desalineades amb les de TMDB (cas Ina
   prova("S4E7 → absolut 127", un(4,7)?.includes("T3xC27"));
   prova("S4E21 → absolut 141, l'últim", un(4,21)?.includes("T3xC41"));
   prova("fora de rang no retorna res", un(4,22) === null && un(9,1) === null);
+
+  // Si al Drive falten episodis, la reserva per posició donaria un episodi
+  // EQUIVOCAT. En aquest cas val més no retornar res.
+  const estIncompleta = [undefined, 60, 60, 60, 70];   // TMDB compta 250, al Drive n'hi ha 141
+  const unInc = (s, e) => {
+    const r = trobaEpisodis(fs, s, e, estIncompleta);
+    return r.matches.length === 1 ? r.matches[0].nomArxiu : null;
+  };
+  prova("col·lecció incompleta: no inventa cap episodi", unInc(4,1) === null);
+  prova("col·lecció incompleta: el que sí existeix segueix sortint", unInc(2,45)?.includes("T2xC45"));
 }
 
 console.log("\n"+"═".repeat(72));

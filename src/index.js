@@ -81,7 +81,7 @@ const CONFIG = {
 
 // Identificador de la versió del codi. Serveix per verificar via /versio
 // quina versió s'està executant realment al worker.
-const VERSIO_CODI = "2026-09-06.temporades-desalineades";
+const VERSIO_CODI = "2026-09-06.reserva-absoluta-protegida";
 
 const MANIFEST = {
     id: "stremio.gdrive.worker.cat",
@@ -2167,6 +2167,26 @@ function trobaEpisodis(fitxersRuta, targetSeason, targetEpisode, estructura) {
                 } else {
                     grups[vistos.get(clau)].push(it);
                 }
+            }
+
+            // Aquesta reserva només té sentit si la col·lecció és COMPLETA i
+            // l'única diferència amb TMDB és com es reparteixen les
+            // temporades. Si al Drive hi ha bastants menys episodis dels que
+            // TMDB compta, vol dir que en falten: llavors mapar per posició
+            // donaria un episodi equivocat, i val més dir que no hi és.
+            const totalTmdb = estructura
+                .slice(1)
+                .reduce((a, b) => a + (b || 0), 0);
+            const colleccioCompleta =
+                totalTmdb > 0 && grups.length >= totalTmdb * 0.9;
+
+            if (!colleccioCompleta) {
+                console.log({
+                    message: "Col·lecció incompleta: no s'aplica la reserva absoluta",
+                    episodisAlDrive: grups.length, episodisSegonsTmdb: totalTmdb,
+                    targetSeason, targetEpisode,
+                });
+                return { matches: [], estrategia: esquema, esquema };
             }
 
             if (absolut >= 1 && absolut <= grups.length) {
