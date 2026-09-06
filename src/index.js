@@ -838,47 +838,75 @@ async function getTmdbMeta(type, id) {
 
 function cleanTitleForSearch(name) {
     const originalTitleMatch = name.match(/\(([A-Z][A-Za-z][\w\s:!?'&\-,.]{2,})\)/);
-    const originalTitle = originalTitleMatch && 
+    const originalTitle = originalTitleMatch &&
         !/(?:FLAC|DTS|cat|esp|eng|jap|val|cas|mal|sub|dub|BD|HD|AVC)/i.test(originalTitleMatch[1])
         ? originalTitleMatch[1].trim() : null;
-    
+
     let cleanedName = name
         .replace(/\.[a-z0-9]{3,4}$/i, "")
-        .replace(/\[.*?\]/g, "")
-        .replace(/\((\d{4})\)/g, "")
-        .replace(/\([^)]*\d{4}[^)]*\)/g, "")
-        .replace(/\([^)]*(?:cat|esp|eng|jap|sub|dub|FLAC|DTS|AVC|BD|HD|by\s)[^)]*\)/gi, "")
-        .replace(/\b\d{3,4}p\b/gi, "")
-        .replace(/\b(?:BDRemux|BluRay|WEB-?DL|WEBRip|HDRip|DVDRip|HDTV|CAM|REMUX|UHD|4K)\b/gi, "")
-        .replace(/\b(?:x264|x265|h264|h265|HEVC|AVC|AAC|FLAC|DTS|Atmos|AC3|DoVi|HDR\d*)\b/gi, "")
-        .replace(/\b(?:CAT|ESP|ENG|JAP|VAL|CAS|MAL)(?:\s*[-]\s*(?:CAT|ESP|ENG|JAP|VAL|CAS|MAL))*\b/g, "")
-        .replace(/\b(?:cat|esp|eng|jap|val|cas|mal)\b/gi, "")
-        .replace(/\bby\s+\w+/gi, "")
-        .replace(/\bv\d+\b/gi, "")
-        .replace(/\s*M\d+\s*/g, " ")
-        .replace(/\bREEL\d+\b/gi, "")
-        .replace(/\b\d+th\s+Anniversary\b/gi, "")
-        .replace(/\d+-\d+/g, "")
+        .replace(/\[.*?\]/g, " ")
+        .replace(/\((\d{4})\)/g, " ")
+        .replace(/\([^)]*\d{4}[^)]*\)/g, " ")
+        .replace(/\([^)]*(?:cat|esp|eng|jap|sub|dub|FLAC|DTS|AVC|BD|HD|by\s)[^)]*\)/gi, " ")
+        .replace(/\b\d{3,4}p\b/gi, " ")
+        .replace(/\b(?:BDRemux|BluRay|WEB-?DL|WEBRip|HDRip|DVDRip|HDTV|CAM|REMUX|UHD|4K)\b/gi, " ")
+        .replace(/\b(?:x264|x265|h264|h265|HEVC|AVC|AAC|FLAC|DTS|Atmos|AC3|DoVi|HDR\d*)\b/gi, " ")
+        .replace(/\b(?:CAT|ESP|ENG|JAP|VAL|CAS|MAL)(?:\s*[-]\s*(?:CAT|ESP|ENG|JAP|VAL|CAS|MAL))*\b/g, " ")
+        .replace(/\b(?:cat|esp|eng|jap|val|cas|mal)\b/gi, " ")
+        .replace(/\bby\s+\w+/gi, " ")
+        .replace(/\bv\d+\b/gi, " ")
+        .replace(/\bREEL\d+\b/gi, " ")
+        .replace(/\b\d+th\s+Anniversary\b/gi, " ")
         .replace(/\s+/g, " ")
         .trim();
 
     const yearMatch = name.match(/\((\d{4})\)/);
     const year = yearMatch ? yearMatch[1] : null;
 
-    const queries = [];
-    if (originalTitle) queries.push(originalTitle);
-    if (cleanedName && cleanedName.length > 1) queries.push(cleanedName);
+    // ── Generació de candidats ────────────────────────────────────────────
+    // Els noms reals porten marques de capítol o de format enmig del títol
+    // ("Regnat de Sang -01- Hikatxi", "Macross Plus OVA 1", "Bola de Drac M07").
+    // Cada marca d'aquestes talla el títol real: el que ve després és el nom
+    // de l'episodi, no part del títol de l'obra. Generem candidats de més
+    // específic a més curt i deixem que la puntuació triï.
+    const candidats = [];
+    const afegeix = (t) => {
+        const net = (t || "").replace(/[\s\-–_:.]+$/,"").replace(/^[\s\-–_:.]+/,"").trim();
+        if (net.length > 1 && !candidats.includes(net)) candidats.push(net);
+    };
 
-    return { queries, year };
+    // Talla a la primera marca de capítol/OVA/pel·lícula numerada
+    const TALLS = [
+        /\s[-–]\s*\d{1,3}\s*[-–]\s/,                          // "Títol -01- Subtítol"
+        /\s\b(?:OVA|OAV|ONA|Especial|Special|Movie|Film|Pel[·.]?l[íi]cula)\b\s*\d*/i,
+        /\s\bM\d{1,2}\b/,                                      // "Bola de Drac M07"
+        /\s\b(?:Temporada|Season|Saga|Part|Parte)\b\s*\d+/i,
+        /\s[-–]\s/,                                             // primer guió solt
+    ];
+    for (const tall of TALLS) {
+        const m = tall.exec(cleanedName);
+        if (m && m.index > 2) { afegeix(cleanedName.slice(0, m.index)); break; }
+    }
+
+    if (originalTitle) afegeix(originalTitle);
+    afegeix(cleanedName);
+
+    // Candidat curt: les 3 primeres paraules. Rescata títols llargs amb
+    // subtítol enganxat sense cap separador reconegut.
+    const paraules = cleanedName.split(/\s+/);
+    if (paraules.length > 3) afegeix(paraules.slice(0, 3).join(" "));
+
+    return { queries: candidats, year };
 }
 
 // ── Resolució de títols en català ─────────────────────────────────────────
-// TMDB cerca per títol original, traduccions i títols alternatius, però les
-// traduccions CATALANES sovint no hi són. Per això, quan TMDB falla, anem a
-// la Viquipèdia catalana: els seus articles estan enllaçats a Wikidata, que
-// guarda l'ID d'IMDb a la propietat P345. Així obtenim l'ID d'IMDb a partir
-// del títol català, i amb això AIOMetadata ja pot aportar tota la metadata.
-async function imdbDesDeViquipedia(titol, any) {
+// TMDB cerca pel títol original, les traduccions i els títols alternatius,
+// però les traduccions CATALANES sovint no hi són. Quan TMDB falla anem a la
+// Viquipèdia: els seus articles enllacen a Wikidata, que guarda l'ID d'IMDb a
+// la propietat P345. Provem primer en català i després en castellà, perquè
+// molts títols d'aquest fons hi surten com "Los Bobobobs" o "El mundo de
+// Rumiko" encara que el fitxer estigui en català.
+async function imdbDesDeViquipedia(titol, any, wiki = "ca") {
     if (!quedaPressupost(4)) return null;
     try {
         const cerca = any ? `${titol} ${any}` : titol;
@@ -895,7 +923,7 @@ async function imdbDesDeViquipedia(titol, any) {
         });
 
         if (!consumeix(1)) return null;
-        const res = await fetch(`https://ca.wikipedia.org/w/api.php?${params}`, {
+        const res = await fetch(`https://${wiki}.wikipedia.org/w/api.php?${params}`, {
             headers: { "User-Agent": "stremio-gdrive-addon-cat/1.0" },
         });
         if (!res.ok) return null;
@@ -908,13 +936,13 @@ async function imdbDesDeViquipedia(titol, any) {
             .slice(0, 3);
         if (qids.length === 0) return null;
 
-        // Una sola crida per a tots els candidats
+        // Una sola crida a Wikidata per a tots els candidats
         if (!consumeix(1)) return null;
         const wdParams = new URLSearchParams({
             action: "wbgetentities",
             ids: qids.join("|"),
             props: "claims|labels",
-            languages: "ca|es|en",
+            languages: "en|ca|es",
             format: "json",
         });
         const wdRes = await fetch(`https://www.wikidata.org/w/api.php?${wdParams}`, {
@@ -927,14 +955,15 @@ async function imdbDesDeViquipedia(titol, any) {
             const ent = wdData?.entities?.[qid];
             const imdb = ent?.claims?.P345?.[0]?.mainsnak?.datavalue?.value;
             if (typeof imdb === "string" && /^tt\d+$/.test(imdb)) {
-                const label = ent?.labels?.en?.value || ent?.labels?.ca?.value || null;
-                console.log({ message: "IMDb via Viquipèdia", titol, imdb, label });
+                const label = ent?.labels?.en?.value || ent?.labels?.ca?.value
+                    || ent?.labels?.es?.value || null;
+                console.log({ message: "IMDb via Viquipèdia", wiki, titol, imdb, label });
                 return { imdbId: imdb, title: label };
             }
         }
         return null;
     } catch (e) {
-        console.error({ message: "Viquipèdia ha fallat", titol, error: e.toString() });
+        console.error({ message: "Viquipèdia ha fallat", wiki, titol, error: e.toString() });
         return null;
     }
 }
@@ -1005,12 +1034,19 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
             return m;
         }
 
-        // NIVELL 1: el títol tal com surt al fitxer/carpeta
-        let millor = await cercaTmdb(queries[0]);
+        // NIVELL 1: provar els candidats de títol contra TMDB, de més
+        // específic a més curt. Ens aturem en trobar una coincidència exacta.
+        let millor = null;
+        for (const q of queries) {
+            if (!quedaPressupost(5)) break;
+            const m = await cercaTmdb(q);
+            if (m && (!millor || m.score > millor.score)) millor = m;
+            if (millor?.score === 3) break;
+        }
 
         // NIVELL 2: sense accents. "Anastàsia" → "Anastasia" casa directament
         // amb el títol que TMDB té indexat en molts casos.
-        if ((!millor || millor.score < 2) && quedaPressupost(5)) {
+        if ((!millor || millor.score < 3) && quedaPressupost(5)) {
             const sa = senseAccents(queries[0]);
             if (sa !== queries[0]) {
                 const alt = await cercaTmdb(sa);
@@ -1018,29 +1054,26 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
             }
         }
 
-        // NIVELL 2b: la segona consulta (títol original entre parèntesis)
-        if ((!millor || millor.score < 2) && queries[1] && quedaPressupost(5)) {
-            const alt = await cercaTmdb(queries[1]);
-            if (alt && (!millor || alt.score > millor.score)) millor = alt;
-        }
-
-        // NIVELL 3: Viquipèdia catalana → Wikidata → IMDb. És l'únic camí
-        // fiable per als títols catalans que TMDB no té traduïts.
-        if ((!millor || millor.score < 2) && quedaPressupost(5)) {
-            const viqui = await imdbDesDeViquipedia(queries[0], year);
-            if (viqui?.imdbId) {
-                const out = {
-                    poster: `https://btttr.cc/poster-n/imdb/poster-default/${viqui.imdbId}.jpg`,
-                    background: null,
-                    imdbId: viqui.imdbId,
-                    tmdbId: null,
-                    tmdbType: preferTv ? "tv" : "movie",
-                    title: viqui.title,
-                    score: 2,
-                    font: "viquipedia",
-                };
-                TMDB_CACHE.set(cacheKey, out);
-                return out;
+        // NIVELL 3: Viquipèdia (catalana i castellana) → Wikidata → IMDb.
+        // És l'únic camí fiable per als títols que TMDB no té traduïts.
+        if ((!millor || millor.score < 2)) {
+            for (const wiki of ["ca", "es"]) {
+                if (!quedaPressupost(4)) break;
+                const viqui = await imdbDesDeViquipedia(queries[0], year, wiki);
+                if (viqui?.imdbId) {
+                    const out = {
+                        poster: `https://btttr.cc/poster-n/imdb/poster-default/${viqui.imdbId}.jpg`,
+                        background: null,
+                        imdbId: viqui.imdbId,
+                        tmdbId: null,
+                        tmdbType: preferTv ? "tv" : "movie",
+                        title: viqui.title,
+                        score: 2,
+                        font: "viquipedia:" + wiki,
+                    };
+                    TMDB_CACHE.set(cacheKey, out);
+                    return out;
+                }
             }
         }
 
