@@ -403,6 +403,7 @@ function titolEpisodiDeNom(nomArxiu, titolsSerie = []) {
         .replace(SXE_REGEX, " ")
         .replace(NXM_REGEX, " ")
         .replace(TEMPORADA_EP_REGEX, " ")
+        .replace(TXC_REGEX, " ")
         .replace(EP_EXPLICIT_REGEX, " ")
         .replace(/\b\d{3,4}p\b/gi, " ")
         .replace(/\b(?:x26[45]|h\.?26[45]|HEVC|AVC|AAC|FLAC|DTS|AC3|DD[P+]?\d?(?:\.\d)?|Atmos|DoVi|HDR\d*)\b/gi, " ")
@@ -842,14 +843,23 @@ function cleanTitleForSearch(name) {
         !/(?:FLAC|DTS|cat|esp|eng|jap|val|cas|mal|sub|dub|BD|HD|AVC)/i.test(originalTitleMatch[1])
         ? originalTitleMatch[1].trim() : null;
 
-    let cleanedName = name
-        .replace(/\.[a-z0-9]{3,4}$/i, "")
+    let senseExt = name.replace(/\.[a-z0-9]{3,4}$/i, "");
+    // Molts arxius usen punts (o guions baixos) com a separador:
+    // "Robot.Carnival.(K.Otomo,1987).UHDrip.1080p.x264". Si en detectem
+    // uns quants, els convertim en espais; si només n'hi ha un o dos els
+    // deixem estar, per no trencar títols com "Dr. Slump".
+    if ((senseExt.match(/\./g) || []).length >= 3) {
+        senseExt = senseExt.replace(/[._]+/g, " ");
+    }
+    senseExt = senseExt.replace(/_+/g, " ");
+
+    let cleanedName = senseExt
         .replace(/\[.*?\]/g, " ")
         .replace(/\((\d{4})\)/g, " ")
         .replace(/\([^)]*\d{4}[^)]*\)/g, " ")
         .replace(/\([^)]*(?:cat|esp|eng|jap|sub|dub|FLAC|DTS|AVC|BD|HD|by\s)[^)]*\)/gi, " ")
         .replace(/\b\d{3,4}p\b/gi, " ")
-        .replace(/\b(?:BDRemux|BluRay|WEB-?DL|WEBRip|HDRip|DVDRip|HDTV|CAM|REMUX|UHD|4K)\b/gi, " ")
+        .replace(/\b(?:BDRemux|BDRip|BluRay|WEB-?DL|WEBRip|HDRip|DVDRip|HDTV|CAM|REMUX|UHD(?:rip)?|UHDRemux|4K|DVDScr|TS)\b/gi, " ")
         .replace(/\b(?:x264|x265|h264|h265|HEVC|AVC|AAC|FLAC|DTS|Atmos|AC3|DoVi|HDR\d*)\b/gi, " ")
         .replace(/\b(?:CAT|ESP|ENG|JAP|VAL|CAS|MAL)(?:\s*[-]\s*(?:CAT|ESP|ENG|JAP|VAL|CAS|MAL))*\b/g, " ")
         .replace(/\b(?:cat|esp|eng|jap|val|cas|mal)\b/gi, " ")
@@ -860,7 +870,10 @@ function cleanTitleForSearch(name) {
         .replace(/\s+/g, " ")
         .trim();
 
-    const yearMatch = name.match(/\((\d{4})\)/);
+    // L'any pot venir sol "(1987)" o barrejat "(K.Otomo,1987)" / "(1992 480p)"
+    const yearMatch = name.match(/\((\d{4})\)/)
+        || name.match(/\([^)]*?((?:19|20)\d{2})[^)]*?\)/)
+        || name.match(/(?:^|[^\d])((?:19|20)\d{2})(?![\d])/);
     const year = yearMatch ? yearMatch[1] : null;
 
     // ── Generació de candidats ────────────────────────────────────────────
@@ -974,6 +987,38 @@ function senseAccents(t) {
     return (t || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 }
 
+// Donat un ID d'IMDb, demana la caràtula i el fons a TMDB. És una cerca per
+// identificador, no per text, així que sempre encerta si TMDB coneix l'obra.
+// URL de la caràtula generada pel propi worker, per garantir que cap entrada
+// del catàleg es quedi sense imatge.
+function posterGenerat(titol) {
+    return `${globalThis.__origin || ""}/poster?t=${encodeURIComponent(titol || "?")}`;
+}
+
+async function imatgesPerImdb(imdbId) {
+    if (!CONFIG.tmdbApiKey || !imdbId) return null;
+    if (!quedaPressupost(2) || !consumeix(1)) return null;
+    try {
+        const url = API_ENDPOINTS.TMDB_FIND
+            .replace("{id}", imdbId)
+            .replace("{apiKey}", CONFIG.tmdbApiKey);
+        const res = await fetch(url + "&language=ca-ES");
+        if (!res.ok) return null;
+        const data = await res.json();
+        const r = data.movie_results?.[0] || data.tv_results?.[0];
+        if (!r) return null;
+        return {
+            poster: r.poster_path ? `https://image.tmdb.org/t/p/w500${r.poster_path}` : null,
+            background: r.backdrop_path ? `https://image.tmdb.org/t/p/w1280${r.backdrop_path}` : null,
+            tmdbId: r.id,
+            tmdbType: data.movie_results?.length ? "movie" : "tv",
+            title: r.title || r.name || null,
+        };
+    } catch (e) {
+        return null;
+    }
+}
+
 async function getTmdbPosterByName(name, { preferTv = false } = {}) {
     if (!CONFIG.tmdbApiKey) return null;
 
@@ -1061,13 +1106,17 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
                 if (!quedaPressupost(4)) break;
                 const viqui = await imdbDesDeViquipedia(queries[0], year, wiki);
                 if (viqui?.imdbId) {
+                    // Tenim l'ID d'IMDb però encara no la caràtula: la demanem
+                    // a TMDB per ID, que és una cerca exacta i sempre encerta.
+                    const art = await imatgesPerImdb(viqui.imdbId);
                     const out = {
-                        poster: `https://btttr.cc/poster-n/imdb/poster-default/${viqui.imdbId}.jpg`,
-                        background: null,
+                        poster: art?.poster
+                            || `https://btttr.cc/poster-n/imdb/poster-default/${viqui.imdbId}.jpg`,
+                        background: art?.background || null,
                         imdbId: viqui.imdbId,
-                        tmdbId: null,
-                        tmdbType: preferTv ? "tv" : "movie",
-                        title: viqui.title,
+                        tmdbId: art?.tmdbId || null,
+                        tmdbType: art?.tmdbType || (preferTv ? "tv" : "movie"),
+                        title: art?.title || viqui.title,
                         score: 2,
                         font: "viquipedia:" + wiki,
                     };
@@ -1100,9 +1149,12 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
         }
 
         const out = {
-            poster: imdbId
-                ? `https://btttr.cc/poster-n/imdb/poster-default/${imdbId}.jpg`
-                : (result.poster_path ? `https://image.tmdb.org/t/p/w500${result.poster_path}` : null),
+            // TMDB serveix les imatges des d'un CDN sense clau ni límits, i la
+            // seva cobertura és molt més alta que la de btttr.cc. Per això va
+            // primer; btttr.cc queda com a reserva quan TMDB no té caràtula.
+            poster: result.poster_path
+                ? `https://image.tmdb.org/t/p/w500${result.poster_path}`
+                : (imdbId ? `https://btttr.cc/poster-n/imdb/poster-default/${imdbId}.jpg` : null),
             background: result.backdrop_path
                 ? `https://image.tmdb.org/t/p/w1280${result.backdrop_path}`
                 : null,
@@ -1374,6 +1426,8 @@ async function walkCollectionFiles(rootFolderId, accessToken, maxDepth = 6) {
 const SXE_REGEX = /\bs(\d{1,2})[ ._-]?e(\d{1,3})\b/i;
 const NXM_REGEX = /\b(\d{1,2})x(\d{1,3})\b/i;
 const TEMPORADA_EP_REGEX = /\b(?:temporada|season|saga|temp|st)[\s._-]*(\d{1,2})[\s._-]*(?:cap[íi]tol|episodi|episode|ep|cap)[\s._-]*(\d{1,3})\b/i;
+// Format català molt estès: "T1xC11", "T01 C11", "T2xC05", "1xC11".
+const TXC_REGEX = /\bT?\s*(\d{1,2})\s*[x×]?\s*C\s*(\d{1,3})\b/i;
 const EP_EXPLICIT_REGEX = /\b(?:cap[íi]tol|episodi|episode|ep|cap)[\s._-]*(\d{1,3})\b/i;
 // Número solt: prioritza el que està separat per guions/espais (ex. "Bola de Drac - 042 - Títol")
 const NUMERO_SEPARAT_REGEX = /(?:^|[\s._-])(\d{1,3})(?=[\s._-]|$)/;
@@ -1403,6 +1457,9 @@ function extreuNumeroEpisodi(nomArxiu) {
 
     m = TEMPORADA_EP_REGEX.exec(net);
     if (m) return { season: parseInt(m[1], 10), episode: parseInt(m[2], 10), font: "SxE" };
+
+    m = TXC_REGEX.exec(net);
+    if (m) return { season: parseInt(m[1], 10), episode: parseInt(m[2], 10), font: "TxC" };
 
     m = NXM_REGEX.exec(net);
     if (m) return { season: parseInt(m[1], 10), episode: parseInt(m[2], 10), font: "NxM" };
@@ -1781,6 +1838,7 @@ async function handleRequest(request) {
             decodeURIComponent(request.url).replace("%3A", ":")
         );
         globalThis.playbackUrl = url.origin + "/playback";
+        globalThis.__origin = url.origin;
 
         if (url.pathname === "/manifest.json") {
             const manifest = MANIFEST;
@@ -1854,6 +1912,59 @@ async function handleRequest(request) {
         // Escalfa el mapa: resol tants títols com permeti el pressupost i et
         // diu quants en queden. Cridant-lo unes quantes vegades el catàleg
         // queda complet i, a partir d'aquí, carrega a l'instant.
+        // Caràtula generada al vol. És l'última xarxa de seguretat: quan no
+        // hi ha imatge ni a TMDB ni a btttr.cc, val més una portada amb el
+        // títol que no pas el requadre buit. No costa cap subpetició.
+        if (url.pathname === "/poster") {
+            const titol = (url.searchParams.get("t") || "?").slice(0, 60);
+            const esc = (t) => t.replace(/[<>&"']/g, (c) => ({
+                "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;", "'": "&#39;",
+            }[c]));
+
+            // Color estable derivat del títol: cada obra té sempre el mateix
+            const codi = [...titol].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7);
+            const to = codi % 360;
+
+            // Partim el títol en línies de ~16 caràcters sense trencar paraules
+            const paraules = titol.split(/\s+/);
+            const linies = [];
+            let actual = "";
+            for (const w of paraules) {
+                if ((actual + " " + w).trim().length > 16 && actual) {
+                    linies.push(actual.trim());
+                    actual = w;
+                } else {
+                    actual = (actual + " " + w).trim();
+                }
+            }
+            if (actual) linies.push(actual);
+            const visibles = linies.slice(0, 6);
+
+            const inicial = 300 - (visibles.length - 1) * 26;
+            const textos = visibles.map((l, i) =>
+                `<text x="200" y="${inicial + i * 52}" text-anchor="middle" ` +
+                `font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" ` +
+                `font-size="40" font-weight="600" fill="#ffffff">${esc(l)}</text>`
+            ).join("");
+
+            const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="400" height="600" viewBox="0 0 400 600">
+<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0%" stop-color="hsl(${to},45%,32%)"/>
+<stop offset="100%" stop-color="hsl(${(to + 40) % 360},50%,14%)"/>
+</linearGradient></defs>
+<rect width="400" height="600" fill="url(#g)"/>
+<rect x="20" y="20" width="360" height="560" fill="none" stroke="rgba(255,255,255,.15)" stroke-width="2" rx="8"/>
+${textos}
+</svg>`;
+            return new Response(svg, {
+                headers: {
+                    "Content-Type": "image/svg+xml; charset=utf-8",
+                    "Cache-Control": "public, max-age=31536000",
+                    "Access-Control-Allow-Origin": "*",
+                },
+            });
+        }
+
         if (url.pathname === "/omplir") {
             const accessToken = await getAccessToken();
             if (!accessToken) return createJsonResponse({ error: "Credencials invàlides" }, 500);
@@ -2016,7 +2127,7 @@ ${acabat
                 name: dades?.title || name,
                 type: "movie",
                 posterShape: "poster",
-                poster: dades?.poster || thumbnail || null,
+                poster: dades?.poster || thumbnail || posterGenerat(dades?.title || name),
                 background: dades?.background || thumbnail || null,
                 description:
                     `Mida: ${formatSize(size)}` +
@@ -2184,7 +2295,7 @@ ${acabat
                             type: "series",
                             name: dades.title || folder.name,
                             posterShape: "poster",
-                            poster: dades.poster || null,
+                            poster: dades.poster || posterGenerat(dades.title || folder.name),
                             background: dades.background || null,
                         });
                     } else {
@@ -2193,7 +2304,7 @@ ${acabat
                             type: "series",
                             name: folder.name,
                             posterShape: "poster",
-                            poster: dades.poster || null,
+                            poster: dades.poster || posterGenerat(folder.name),
                             background: dades.background || null,
                         });
                     }
@@ -2205,6 +2316,7 @@ ${acabat
                         type: "series",
                         name: folder.name,
                         posterShape: "poster",
+                        poster: posterGenerat(folder.name),
                     });
                 }
 
