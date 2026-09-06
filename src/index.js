@@ -71,6 +71,10 @@ const CONFIG = {
     ],
 };
 
+// Identificador de la versió del codi. Serveix per verificar via /versio
+// quina versió s'està executant realment al worker.
+const VERSIO_CODI = "2026-09-06.esquema-episodis-unificat";
+
 const MANIFEST = {
     id: "stremio.gdrive.worker.cat",
     version: "1.0.0",
@@ -2140,6 +2144,28 @@ async function handleRequest(request) {
                 });
             }
             return createJsonResponse(manifest);
+        }
+
+        // Diu quina versió del codi s'està executant realment. Serveix per
+        // saber d'un cop d'ull si un desplegament ha arribat de debò o si
+        // encara s'executa una versió antiga.
+        if (url.pathname === "/versio") {
+            const mapa = await carregaMapa();
+            const total = Object.keys(mapa || {}).length;
+            const ambImdb = Object.values(mapa || {}).filter((v) => v?.imdbId).length;
+            return createJsonResponse({
+                versio: VERSIO_CODI,
+                funcionsPresents: {
+                    deteccioEsquemaEpisodis: typeof detectaEsquema === "function",
+                    llistatICercaUnificats:
+                        typeof assignaEpisodis === "function" && typeof trobaEpisodis === "function",
+                    indexInversDelMapa: typeof buscaAlMapa === "function",
+                    caratulaGenerada: typeof pngPortada === "function",
+                    resolucioViquipedia: typeof imdbDesDeViquipedia === "function",
+                    reintentTitolsFallits: typeof calReintentar === "function",
+                },
+                mapa: { entrades: total, ambImdbId: ambImdb, sensResoldre: total - ambImdb },
+            });
         }
 
         if (url.pathname === "/")
