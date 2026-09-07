@@ -81,7 +81,7 @@ const CONFIG = {
 
 // Identificador de la versió del codi. Serveix per verificar via /versio
 // quina versió s'està executant realment al worker.
-const VERSIO_CODI = "2026-09-06.doraemon-rellancaments";
+const VERSIO_CODI = "2026-09-07.viquipedia-titol-estricte";
 
 const MANIFEST = {
     id: "stremio.gdrive.worker.cat",
@@ -1003,7 +1003,39 @@ async function imdbDesDeViquipedia(titol, any, wiki = "ca") {
         const data = await res.json();
         const pagines = data?.query?.pages || [];
 
-        const qids = pagines
+        // La cerca de la Viquipèdia és de TEXT COMPLET: retorna articles que
+        // només mencionen la frase. Agafar-ne el primer sense mirar el títol
+        // produïa disbarats com "Espies de veritat" → 2001: A Space Odyssey
+        // o "La Betty atòmica" → Hulk. I un IMDb ID equivocat és pitjor que
+        // cap: enverina el mapa i trenca els streams. Així que només
+        // acceptem articles el TÍTOL dels quals coincideixi de veritat.
+        const objectiu = normalitzaTitol(titol);
+        const acceptables = pagines.filter((pg) => {
+            const t = normalitzaTitol(
+                String(pg?.title || "").replace(/\s*\([^)]*\)\s*$/, "")   // treu "(sèrie de televisió)"
+            );
+            if (!t || !objectiu) return false;
+            // Estrictament el mateix títol. Res de prefixos: "Memòries
+            // d'Àfrica" comença per "memories" i colava per "Memories".
+            // Aquí val més quedar-se curt: no trobar-ho costa una caràtula,
+            // però encertar-ho malament trenca els streams de la sèrie.
+            if (t === objectiu) return true;
+            // Només s'admet el sufix de desambiguació habitual
+            return ["serie", "pel·licula", "pelicula", "anime", "manga",
+                    "serie de televisio", "film"]
+                .some((sufix) => t === `${objectiu} ${sufix}`);
+        });
+
+        if (acceptables.length === 0) {
+            console.log({
+                message: "Viquipèdia: cap article amb el títol correcte",
+                wiki, titol,
+                trobats: pagines.map((pg) => pg?.title).slice(0, 3),
+            });
+            return null;
+        }
+
+        const qids = acceptables
             .map((pg) => pg?.pageprops?.wikibase_item)
             .filter(Boolean)
             .slice(0, 3);

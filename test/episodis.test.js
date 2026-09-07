@@ -262,6 +262,38 @@ console.log("\n── Tria de subcarpeta dins un contenidor de franquícia");
   if (mal.length) console.log("      fallats:", JSON.stringify(mal.map((x) => x[0])));
 }
 
+console.log("\n── Viquipèdia: només s'accepten articles amb el títol correcte");
+{
+  // Casos reals dels logs, on la cerca de text complet retornava disbarats.
+  const norm = ctx.normalitzaTitol;
+  const accepta = (consulta, titolArticle) => {
+    const objectiu = norm(consulta);
+    const t = norm(String(titolArticle).replace(/\s*\([^)]*\)\s*$/, ""));
+    if (!t || !objectiu) return false;
+    if (t === objectiu) return true;
+    return ["serie","pel·licula","pelicula","anime","manga","serie de televisio","film"]
+      .some((sufix) => t === `${objectiu} ${sufix}`);
+  };
+  const fora = [
+    ["Espies de veritat", "2001: una odissea de l'espai"],
+    ["La Betty atòmica", "Hulk (personatge)"],
+    ["Mandarina & Cow", "Ara em veus 2"],
+    ["Combat Xiaolin", "La llegenda del puny"],
+    ["Memories", "Memòries d'Àfrica"],
+    ["Regnat de Sang", "Love Lies Bleeding"],
+    ["Hiroshima 1983", "Hiroshima mon amour"],
+    ["Doraemon 2005", "Doraemon Comes Back"],
+  ];
+  const dins = [
+    ["Caçadors de dracs", "Caçadors de dracs"],
+    ["Viatges Pokémon", "Viatges Pokémon"],
+    ["Regnat de Sang", "Regnat de Sang (sèrie de televisió)"],
+    ["Bola de Drac", "Bola de Drac (sèrie)"],
+  ];
+  prova(`${fora.length} coincidències falses es rebutgen`, fora.every(([c,t]) => !accepta(c,t)));
+  prova(`${dins.length} coincidències bones s'accepten`, dins.every(([c,t]) => accepta(c,t)));
+}
+
 console.log("\n"+"═".repeat(72));
 console.log(fall===0 ? `TOTES LES ${total} PROVES PASSEN` : `${fall} de ${total} PROVES FALLEN`);
 process.exit(fall?1:0);
