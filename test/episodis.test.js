@@ -294,6 +294,26 @@ console.log("\n── Viquipèdia: només s'accepten articles amb el títol corr
   prova(`${dins.length} coincidències bones s'accepten`, dins.every(([c,t]) => accepta(c,t)));
 }
 
+console.log("\n── Numeració plana amb temporades desconegudes per TMDB (Bola de Drac)");
+{
+  // Cas real: 153 fitxers numerats de l'1 al 153; TMDB té la sèrie com una
+  // sola temporada, però Stremio (via TVDB) en demana 9. L'estructura de
+  // Cinemeta permet convertir temporada/episodi a número absolut.
+  const talls = [28, 29, 23, 23, 10, 17, 14, 4, 5];   // suma 153
+  const est = [undefined, ...talls];
+  const fs153 = Array.from({ length: 153 }, (_, i) =>
+    f([`Serie - ${String(i + 1).padStart(3, "0")} - Cap.mkv`]));
+  const casos = [[1,1],[1,13],[2,1],[4,1],[9,5]];
+  const mal = casos.filter(([s, e]) => {
+    let abs = 0; for (let i = 1; i < s; i++) abs += talls[i - 1]; abs += e;
+    const r = trobaEpisodis(fs153, s, e, est);
+    return !(r.matches.length === 1 &&
+             r.matches[0].nomArxiu.includes(`- ${String(abs).padStart(3, "0")} -`));
+  });
+  prova(`${casos.length} peticions de temporades altes es converteixen a absolut`, mal.length === 0);
+  if (mal.length) console.log("      fallats:", JSON.stringify(mal));
+}
+
 console.log("\n"+"═".repeat(72));
 console.log(fall===0 ? `TOTES LES ${total} PROVES PASSEN` : `${fall} de ${total} PROVES FALLEN`);
 process.exit(fall?1:0);

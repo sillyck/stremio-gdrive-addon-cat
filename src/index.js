@@ -51,7 +51,10 @@ const CONFIG = {
     // Per tornar-la a activar, posa-hi true. Amb ella activada, una
     // col·lecció gran com El Detectiu Conan no esgota el pressupost de
     // subpeticions; sense ella, pot tornar a quedar-se a mig recórrer.
-    usaCauRecorregut: false,
+    // Reactivat: la clau del cau inclou la versió del codi, així que cada
+    // desplegament l'invalida sol i ja no pot servir un arbre antic. Sense
+    // cau, Doraemon trigava 14,8 s per petició.
+    usaCauRecorregut: true,
     // Durada del mapa a la memòria cau (segons). 7 dies.
     mapaTtlSegons: 604800,
     driveQueryTerms: {
@@ -81,7 +84,7 @@ const CONFIG = {
 
 // Identificador de la versió del codi. Serveix per verificar via /versio
 // quina versió s'està executant realment al worker.
-const VERSIO_CODI = "2026-09-07.viquipedia-titol-estricte";
+const VERSIO_CODI = "2026-09-07.cinemeta-temporades+tmdb-ids+cau";
 
 const MANIFEST = {
     id: "stremio.gdrive.worker.cat",
@@ -2090,6 +2093,42 @@ async function walkCollectionFiles(rootFolderId, accessToken, maxDepth = 6, tito
 // Obté quants episodis té cada temporada segons TMDB. Això és el que permet
 // convertir una numeració absoluta (ex. One Piece 001..1100) a season/episode
 // i viceversa, que és la causa principal del desordre d'episodis.
+// Estructura de temporades segons Cinemeta. Serveix de reserva quan la de
+// TMDB no cobreix la temporada demanada: en passar AIOMetadata a TVDB, les
+// temporades que demana Stremio ja no són les de TMDB. Dragon Ball n'és el
+// cas clar: TMDB el té com una sola temporada de 153 episodis, i per això
+// una petició de la temporada 2 no es podia convertir a número absolut.
+async function getSeasonStructureCinemeta(imdbId) {
+    const clau = "cinemeta:" + imdbId;
+    if (SEASON_STRUCTURE_CACHE.has(clau)) return SEASON_STRUCTURE_CACHE.get(clau);
+    if (!quedaPressupost(3) || !consumeix(1)) return null;
+    try {
+        const res = await fetch(
+            API_ENDPOINTS.CINEMETA.replace("{type}", "series").replace("{id}", imdbId)
+        );
+        if (!res.ok) return null;
+        const data = await res.json();
+        const videos = data?.meta?.videos || [];
+        if (videos.length === 0) return null;
+
+        const comptes = [];
+        for (const v of videos) {
+            const s = Number(v.season);
+            if (!Number.isFinite(s) || s < 1) continue;   // 0 = especials
+            comptes[s] = (comptes[s] || 0) + 1;
+        }
+        const estructura = comptes.length > 1 ? comptes : null;
+        SEASON_STRUCTURE_CACHE.set(clau, estructura);
+        console.log({
+            message: "Estructura de temporades via Cinemeta",
+            imdbId, temporades: estructura ? estructura.length - 1 : 0,
+        });
+        return estructura;
+    } catch (e) {
+        return null;
+    }
+}
+
 async function getSeasonStructure(imdbId) {
     if (SEASON_STRUCTURE_CACHE.has(imdbId)) return SEASON_STRUCTURE_CACHE.get(imdbId);
     if (!CONFIG.tmdbApiKey) return null;
@@ -3506,9 +3545,43 @@ async function findMovieFiles(imdbId, accessToken) {
     return files;
 }
 
+// Converteix un identificador de TMDB en el seu IMDb ID. AIOMetadata pot
+// oferir entrades amb "tmdb:123456" quan el proveïdor de pel·lícules és TMDB
+// i el títol no té IMDb ID mapat; sense aquesta conversió, la petició no
+// arribava enlloc perquè tot el nostre índex va per IMDb.
+async function imdbDesDeTmdbId(tmdbId, type) {
+    if (!CONFIG.tmdbApiKey || !tmdbId) return null;
+    if (!quedaPressupost(3) || !consumeix(1)) return null;
+    try {
+        const mena = type === "series" ? "tv" : "movie";
+        const url = API_ENDPOINTS.TMDB_EXTERNAL_IDS
+            .replace("{type}", mena)
+            .replace("{id}", tmdbId)
+            .replace("{apiKey}", CONFIG.tmdbApiKey);
+        const res = await fetch(url);
+        if (!res.ok) return null;
+        const imdb = (await res.json())?.imdb_id;
+        if (typeof imdb === "string" && /^tt\d+$/.test(imdb)) {
+            console.log({ message: "TMDB ID convertit a IMDb", tmdbId, imdb });
+            return imdb;
+        }
+        return null;
+    } catch (e) {
+        return null;
+    }
+}
+
 async function getStreams(streamRequest) {
     const streams = [];
-    const imdbId = streamRequest.id.split(":")[0];
+    let imdbId = streamRequest.id.split(":")[0];
+
+    // "tmdb:123456" → "tt……"
+    if (imdbId === "tmdb") {
+        const tmdbId = streamRequest.id.split(":")[1];
+        const convertit = await imdbDesDeTmdbId(tmdbId, streamRequest.type);
+        if (convertit) imdbId = convertit;
+    }
+
     const esImdb = imdbId.startsWith("tt");
 
     // ── ID intern: apunta a un fitxer concret del Drive ───────────────────
@@ -3546,7 +3619,25 @@ async function getStreams(streamRequest) {
                 const carpetes = await findCollectionFolder(imdbId, accessToken);
                 const targetSeason = parseInt(streamRequest.season, 10);
                 const targetEpisode = parseInt(streamRequest.episode, 10);
-                const structure = await getSeasonStructure(imdbId);
+                let structure = await getSeasonStructure(imdbId);
+                // Si l'estructura de TMDB no arriba a la temporada demanada,
+                // provem la de Cinemeta. Passa quan el proveïdor de metadades
+                // de Stremio (TVDB) reparteix les temporades diferent de TMDB.
+                if (
+                    targetSeason > 1 &&
+                    (!structure || structure[targetSeason] == null)
+                ) {
+                    const alt = await getSeasonStructureCinemeta(imdbId);
+                    if (alt && alt[targetSeason] != null) {
+                        console.log({
+                            message: "Faig servir l'estructura de Cinemeta",
+                            imdbId, targetSeason,
+                            temporadesTmdb: structure ? structure.length - 1 : 0,
+                            temporadesCinemeta: alt.length - 1,
+                        });
+                        structure = alt;
+                    }
+                }
 
                 // Provem cada carpeta candidata fins que alguna contingui
                 // l'episodi. Amb una sola carpeta el comportament és el mateix.
