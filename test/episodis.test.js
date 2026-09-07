@@ -314,6 +314,24 @@ console.log("\n── Numeració plana amb temporades desconegudes per TMDB (Bol
   if (mal.length) console.log("      fallats:", JSON.stringify(mal));
 }
 
+console.log("\n── Carpetes de temporada en català i castellà");
+{
+  const t = ctx.temporadaDeCarpeta;
+  const casos = [
+    [["Llibre 1 - Aigua", "ep.mkv"], 1],   // Avatar, real dels logs
+    [["Llibre 3 - Foc", "ep.mkv"], 3],
+    [["Libro 2", "ep.mkv"], 2],
+    [["Book 3", "ep.mkv"], 3],
+    [["Temporada 4", "ep.mkv"], 4],
+    [["T2", "ep.mkv"], 2],
+    [["03", "ep.mkv"], 3],
+    [["Bola de Drac", "ep.mkv"], null],
+    [["Multi-Audio+Subs", "ep.mkv"], null],
+  ];
+  const mal = casos.filter(([r, esp]) => t(r) !== esp);
+  prova(`${casos.length} noms de carpeta de temporada es llegeixen bé`, mal.length === 0);
+}
+
 console.log("\n"+"═".repeat(72));
 console.log(fall===0 ? `TOTES LES ${total} PROVES PASSEN` : `${fall} de ${total} PROVES FALLEN`);
 process.exit(fall?1:0);

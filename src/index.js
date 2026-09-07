@@ -84,7 +84,7 @@ const CONFIG = {
 
 // Identificador de la versió del codi. Serveix per verificar via /versio
 // quina versió s'està executant realment al worker.
-const VERSIO_CODI = "2026-09-07.cinemeta-temporades+tmdb-ids+cau";
+const VERSIO_CODI = "2026-09-07.llibres-com-a-temporades";
 
 const MANIFEST = {
     id: "stremio.gdrive.worker.cat",
@@ -1904,6 +1904,7 @@ async function desaRecorregutAlCau(folderId, fitxers, marca = "") {
 // INTERNA (temporada, arc, tanda) i no una sèrie diferent.
 const MARQUES_DIVISIO = new Set([
     "temporada", "temporades", "season", "seasons", "saga", "sagues", "sagas",
+    "llibre", "llibres", "libro", "libros", "book", "books",
     "arc", "arcs", "part", "parts", "parte", "partes", "vol", "volum", "volume",
     "capitol", "capitols", "capitulo", "capitulos", "episodi", "episodis",
     "episode", "episodes", "batch", "complete", "completa", "complet",
@@ -2232,7 +2233,9 @@ function netejaSorollNumeric(nom) {
 function temporadaDeCarpeta(ruta) {
     for (let i = ruta.length - 2; i >= 0; i--) {
         const c = ruta[i];
-        let m = /\b(?:temporada|season|saga|temp)[\s._-]*(\d{1,2})\b/i.exec(c);
+        // "Llibre 1 - Aigua" (Avatar), "Libro 2", "Book 3": als doblatges
+        // catalans i castellans les temporades sovint es diuen així.
+        let m = /\b(?:temporada|season|saga|temp|llibre|libro|book|parte?|part)[\s._-]*(\d{1,2})\b/i.exec(c);
         if (m) return parseInt(m[1], 10);
         m = /^\s*[TS]\s*(\d{1,2})\s*$/i.exec(c);
         if (m) return parseInt(m[1], 10);
