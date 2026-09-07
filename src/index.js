@@ -92,7 +92,7 @@ const CONFIG = {
 
 // Identificador de la versió del codi. Serveix per verificar via /versio
 // quina versió s'està executant realment al worker.
-const VERSIO_CODI = "2026-09-07.pelis-i-ovas-de-coleccions";
+const VERSIO_CODI = "2026-09-07.versio-informa-de-pelis";
 
 const MANIFEST = {
     id: "stremio.gdrive.worker.cat",
@@ -2718,7 +2718,7 @@ async function handleRequest(request) {
         // encara s'executa una versió antiga.
         if (url.pathname === "/versio") {
             const mapa = await carregaMapa();
-            const total = Object.keys(mapa || {}).length;
+            const total = Object.keys(mapa || {}).filter((k) => !k.startsWith("__")).length;
             const ambImdb = Object.values(mapa || {}).filter((v) => v?.imdbId).length;
             return createJsonResponse({
                 versio: VERSIO_CODI,
@@ -2732,6 +2732,17 @@ async function handleRequest(request) {
                     reintentTitolsFallits: typeof calReintentar === "function",
                 },
                 mapa: { entrades: total, ambImdbId: ambImdb, sensResoldre: total - ambImdb },
+                pelisDeColeccions: (() => {
+                    const dins = Object.entries(mapa || {})
+                        .filter(([k, v]) => k.startsWith("m:") && v?.deColeccio);
+                    const revisades = (mapa?.__coleccionsRevisades || []).length;
+                    return {
+                        trobades: dins.length,
+                        ambImdbId: dins.filter(([, v]) => v.imdbId).length,
+                        coleccionsRevisades: revisades,
+                        exemples: dins.slice(-6).map(([, v]) => v.title || v.nom),
+                    };
+                })(),
                 cauRecorregut: CONFIG.usaCauRecorregut ? "actiu" : "desactivat (proves)",
             });
         }
