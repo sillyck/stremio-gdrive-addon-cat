@@ -332,6 +332,18 @@ console.log("\n── Carpetes de temporada en català i castellà");
   prova(`${casos.length} noms de carpeta de temporada es llegeixen bé`, mal.length === 0);
 }
 
+console.log("\n── Pel·lícules i OVAs dins les carpetes de sèries");
+{
+  const esPelis = ctx.esCarpetaDePelis;
+  const si = ["Pelis", "Pel·lícules", "Movies", "Films", "OVAs", "OVA", "Especials"];
+  const no = ["Music", "OPs EDs", "Extres", "T1", "Multi-Audio+Subs", "OSTs"];
+  prova(`${si.length} carpetes de pel·lícules es reconeixen`, si.every(esPelis));
+  prova(`${no.length} carpetes que no ho són es descarten`, no.every((n) => !esPelis(n)));
+  // Els episodis normals no s'han de veure afectats pel canvi
+  prova("les carpetes de pel·lícules segueixen fora del recorregut d'episodis",
+        ["Pelis", "OVAs", "Especials"].every(ctx.esCarpetaDExtres));
+}
+
 console.log("\n"+"═".repeat(72));
 console.log(fall===0 ? `TOTES LES ${total} PROVES PASSEN` : `${fall} de ${total} PROVES FALLEN`);
 process.exit(fall?1:0);

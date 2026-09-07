@@ -55,6 +55,14 @@ const CONFIG = {
     // desplegament l'invalida sol i ja no pot servir un arbre antic. Sense
     // cau, Doraemon trigava 14,8 s per petició.
     usaCauRecorregut: true,
+
+    // Buscar també les pel·lícules i OVAs que viuen dins les carpetes de
+    // sèries ("Bola de Drac/Extres/Pelis/…"). S'indexen com a pel·lícules i
+    // apareixen al catàleg de pel·lícules.
+    cercaPelisDinsColeccions: true,
+    // Carpetes de sèrie que es revisen per cada passada d'/omplir. Es guarda
+    // per on s'ha quedat, així que crides successives van avançant.
+    coleccionsPerPassadaPelis: 4,
     // Durada del mapa a la memòria cau (segons). 7 dies.
     mapaTtlSegons: 604800,
     driveQueryTerms: {
@@ -84,7 +92,7 @@ const CONFIG = {
 
 // Identificador de la versió del codi. Serveix per verificar via /versio
 // quina versió s'està executant realment al worker.
-const VERSIO_CODI = "2026-09-07.llibres-com-a-temporades";
+const VERSIO_CODI = "2026-09-07.pelis-i-ovas-de-coleccions";
 
 const MANIFEST = {
     id: "stremio.gdrive.worker.cat",
@@ -1798,6 +1806,60 @@ const CARPETES_NO_EPISODIS = new RegExp(
     "i"
 );
 
+// Carpetes d'extres que SÍ contenen llargmetratges: pel·lícules, OVAs i
+// especials. No són episodis (i per això s'ometen del recorregut d'episodis),
+// però són contingut reproduïble i s'han de poder trobar com a pel·lícules.
+const CARPETES_DE_PELIS = new RegExp(
+    "^\\s*(?:" + [
+        "pel[·.]?l[íi]cules?", "pelis?", "movies?", "films?", "llargmetratges?",
+        "ova(?:s)?", "oav(?:s)?", "ona(?:s)?",
+        "especials?", "specials?",
+    ].join("|") + ")\\s*$",
+    "i"
+);
+
+function esCarpetaDePelis(nom) {
+    return CARPETES_DE_PELIS.test(nom);
+}
+
+// Recull els llargmetratges que viuen dins l'arbre d'una col·lecció:
+// "Bola de Drac/Extres/Pelis/…", "Conan/Extres/OVAs/…". Es recorren només
+// les carpetes que sabem que en contenen, no tot l'arbre, per no gastar
+// pressupost de subpeticions inútilment.
+async function recullPelisDeColeccio(folderId, accessToken, maxDepth = 3) {
+    const trobats = [];
+
+    async function baixa(id, ruta, profunditat, dinsDePelis) {
+        if (profunditat > maxDepth || !quedaPressupost(5)) return;
+        let fills;
+        try {
+            fills = await listChildren(id, accessToken);
+        } catch (e) {
+            return;
+        }
+        for (const item of fills) {
+            if (item.mimeType === FOLDER_MIME) {
+                const esPelis = dinsDePelis || esCarpetaDePelis(item.name);
+                // Fora de les carpetes de pel·lícules només baixem per
+                // "Extres" i similars, que és on solen penjar.
+                const valLaPena = esPelis
+                    || /^\s*(?:extres?|extras?|bonus)\b/i.test(item.name);
+                if (!valLaPena) continue;
+                await baixa(item.id, [...ruta, item.name], profunditat + 1, esPelis);
+            } else if (dinsDePelis && VIDEO_EXT_REGEX.test(item.name)) {
+                // Dins d'una carpeta de pel·lícules, els openings i tràilers
+                // segueixen sense ser contingut principal.
+                if (/\b(?:opening|ending|ncop|nced|tr[àa]iler|trailer|teaser|preview)\b/i
+                    .test(item.name)) continue;
+                trobats.push({ file: item, ruta: [...ruta, item.name] });
+            }
+        }
+    }
+
+    await baixa(folderId, [], 0, false);
+    return trobats;
+}
+
 // Fitxers que són dins la carpeta de la sèrie però NO són episodis:
 // openings, endings, OVAs, pel·lícules, tràilers. Sense aquest filtre, un
 // "OP1.mkv" o un "OVA 01.mkv" es comptava com a episodi 1 i apareixia com a
@@ -2758,6 +2820,56 @@ async function handleRequest(request) {
                 }
             }
 
+            // ── Pel·lícules i OVAs dins les carpetes de sèries ────────────
+            let pelisColeccio = 0;
+            if (CONFIG.cercaPelisDinsColeccions && quedaPressupost(10)) {
+                const jaFetes = new Set(MAPA?.__coleccionsRevisades || []);
+                for (const rootId of CONFIG.collectionsRootFolderIds) {
+                    let carpetes = [];
+                    try { carpetes = await listChildren(rootId, accessToken, { onlyFolders: true }); }
+                    catch (e) { continue; }
+
+                    let revisades = 0;
+                    for (const folder of carpetes) {
+                        if (revisades >= CONFIG.coleccionsPerPassadaPelis) break;
+                        if (!quedaPressupost(10)) break;
+                        if (jaFetes.has(folder.id)) continue;
+
+                        const pelis = await recullPelisDeColeccio(folder.id, accessToken);
+                        for (const p of pelis) {
+                            const clau = "m:" + p.file.id;
+                            if (llegeixMapa(clau)) continue;
+                            if (!quedaPressupost(8)) break;
+                            const r = await getTmdbPosterByName(p.file.name);
+                            escriuMapa(clau, {
+                                imdbId: r?.imdbId || null,
+                                poster: r?.poster || null,
+                                background: r?.background || null,
+                                title: r?.title || null,
+                                deColeccio: true,
+                                nom: p.file.name,
+                                mida: p.file.size || 0,
+                                ...(r?.imdbId ? {} : { intents: 1 }),
+                            });
+                            pelisColeccio++;
+                        }
+
+                        jaFetes.add(folder.id);
+                        revisades++;
+                        if (pelis.length) {
+                            console.log({
+                                message: "Pel·lícules trobades dins una col·lecció",
+                                carpeta: folder.name, quantes: pelis.length,
+                                mostra: pelis.slice(0, 4).map((x) => x.ruta.join("/")),
+                            });
+                        }
+                    }
+                }
+                if (!MAPA) MAPA = {};
+                MAPA.__coleccionsRevisades = [...jaFetes];
+                MAPA_BRUT = true;
+            }
+
             await desaMapa(null);
 
             const alMapa = Object.keys(MAPA || {}).length;
@@ -3132,9 +3244,29 @@ ${acabat
                     if (PRESSUPOST < abans) resoltesAra++;
                 }
 
+                // Pel·lícules i OVAs que viuen dins les carpetes de sèries.
+                // Ja estan resoltes al mapa, així que no costen cap crida.
+                let deColeccions = 0;
+                for (const [clau, v] of Object.entries(MAPA || {})) {
+                    if (!clau.startsWith("m:") || !v?.deColeccio) continue;
+                    const fileId = clau.slice(2);
+                    if (v.imdbId) IMDB_TO_GDRIVE.set(v.imdbId, { type: "movie", id: fileId });
+                    totsMetas.push({
+                        id: v.imdbId || `gdrive:${fileId}`,
+                        name: v.title || v.nom || "?",
+                        type: "movie",
+                        posterShape: "poster",
+                        poster: v.poster || posterGenerat(v.title || v.nom),
+                        background: v.background || null,
+                        description: v.mida ? `Mida: ${formatSize(v.mida)}` : undefined,
+                    });
+                    deColeccions++;
+                }
+
                 const metas = dedupMetas(totsMetas);
                 console.log({
                     message: "Catàleg de pel·lícules",
+                    deColeccions,
                     fitxers: results.files.length,
                     resoltesAra,
                     metas: metas.length,
