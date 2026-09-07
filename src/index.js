@@ -81,7 +81,7 @@ const CONFIG = {
 
 // Identificador de la versió del codi. Serveix per verificar via /versio
 // quina versió s'està executant realment al worker.
-const VERSIO_CODI = "2026-09-06.subcarpeta-titol-mes-llarg";
+const VERSIO_CODI = "2026-09-06.doraemon-rellancaments";
 
 const MANIFEST = {
     id: "stremio.gdrive.worker.cat",
@@ -1774,8 +1774,9 @@ const CARPETES_NO_EPISODIS = new RegExp(
 function esFitxerNoEpisodi(nom) {
     const base = nom.replace(/\.[a-z0-9]{2,4}$/i, "").trim();
 
+    // Si porta una marca explícita d'episodi, és un episodi i prou.
     if (SXE_REGEX.test(base) || TXC_REGEX.test(base) || NXM_REGEX.test(base)
-        || TEMPORADA_EP_REGEX.test(base)) {
+        || TEMPORADA_EP_REGEX.test(base) || EP_EXPLICIT_REGEX.test(base)) {
         return false;
     }
 
@@ -1791,10 +1792,17 @@ function esFitxerNoEpisodi(nom) {
     if (/^(?:trailer|tr[àa]iler|teaser|promo|preview|pv|cm)\b/i.test(net)) return true;
     if (/^(?:nc)?(?:op|ed)\s*\d+\b/i.test(net)) return true;
 
-    // La marca com a paraula solta en qualsevol posició
+    // La marca com a paraula solta en qualsevol posició del nom. Els fitxers
+    // reals són del tipus "DORAEMON · Opening (1).mkv", amb el títol de la
+    // sèrie al davant, així que no n'hi ha prou de mirar el començament.
     if (/\b(?:ncop|nced)\b/i.test(net)) return true;
-    if (/\b(?:opening|ending)\s*\d+\b/i.test(net)) return true;
-    if (/\bova\s*\d+\b/i.test(net)) return true;
+    // "Opening"/"Ending" com a ETIQUETA: al final del nom, opcionalment amb
+    // un número. Així s'atrapa "DORAEMON · Ending (1)" però no es descarta
+    // "Capítol 12 - L'obertura del torneig", on la paraula forma part del
+    // títol de l'episodi.
+    if (/\b(?:opening|ending|obertura|tancament)\s*(?:\(?\s*\d+\s*\)?)?\s*$/i.test(net)) return true;
+    if (/\bova\s*\d*\b/i.test(net)) return true;
+    if (/\b(?:tr[àa]iler|trailer|teaser|promo|preview)\s*(?:\d+)?\s*$/i.test(net)) return true;
 
     return false;
 }
@@ -1906,14 +1914,14 @@ function esSerieGermana(nomCarpeta, titolsNorm) {
 // Si alguna subcarpeta coincideix EXACTAMENT amb el títol que busquem,
 // baixem només per aquella i deixem estar la resta.
 async function afinaCarpetaDeSerie(rootFolderId, titols, accessToken) {
-    if (!titols?.length || !quedaPressupost(6)) return rootFolderId;
+    if (!titols?.length || !quedaPressupost(6)) return [rootFolderId];
     let subcarpetes;
     try {
         subcarpetes = await listChildren(rootFolderId, accessToken, { onlyFolders: true });
     } catch (e) {
-        return rootFolderId;
+        return [rootFolderId];
     }
-    if (subcarpetes.length < 2) return rootFolderId;
+    if (subcarpetes.length < 2) return [rootFolderId];
 
     const titolsNorm = titols.map(normalitzaTitol).filter(Boolean);
 
@@ -1949,7 +1957,7 @@ async function afinaCarpetaDeSerie(rootFolderId, titols, accessToken) {
             titols: titolsNorm.slice(0, 4),
             subcarpetes: subcarpetes.map((x) => x.name).slice(0, 10),
         });
-        return rootFolderId;
+        return [rootFolderId];
     }
 
     const maxLong = Math.max(...candidats.map((c) => c.titol.length));
@@ -1960,15 +1968,20 @@ async function afinaCarpetaDeSerie(rootFolderId, titols, accessToken) {
             message: "Contenidor de franquícia: baixo a la subcarpeta exacta",
             arrel: rootFolderId, subcarpeta: millors[0].sub.name, titol: millors[0].titol,
         });
-        return millors[0].sub.id;
+        return [millors[0].sub.id];
     }
 
+    // Quan diverses subcarpetes coincideixen igual de bé solen ser
+    // RELLANÇAMENTS de la mateixa sèrie ("Doraemon - Wachimiro release" i
+    // "Doraemon [SD 480p]"). Les recorrem totes dues, però no la resta del
+    // contenidor: amb Doraemon l'arrel tenia 3.674 fitxers i en sortien 34
+    // resultats per a un sol episodi.
     console.log({
-        message: "Diverses subcarpetes coincideixen igual de bé: recorro l'arrel",
+        message: "Diverses subcarpetes empaten: recorro només aquestes",
         arrel: rootFolderId,
         empatades: millors.map((c) => c.sub.name).slice(0, 5),
     });
-    return rootFolderId;
+    return millors.map((c) => c.sub.id);
 }
 
 async function walkCollectionFiles(rootFolderId, accessToken, maxDepth = 6, titolsSerie = []) {
@@ -2135,6 +2148,11 @@ function netejaSorollNumeric(nom) {
         .replace(/\b\d+\s*ch\b/gi, " ")
         .replace(/\b4K\b/gi, " ")
         .replace(/\bby\s+\w+/gi, " ")
+        // "part 1", "part1", "part 1-2", "pt 2": indica un TROS d'un episodi,
+        // no el número d'episodi. Sense treure-ho, tots els fitxers acabats
+        // en "part 1" es comptaven com a episodi 1 (el cas de Doraemon, on
+        // sortien 34 resultats per a un sol episodi).
+        .replace(/\b(?:parts?|parte|pt)[\s._-]*\d+(?:\s*[-–]\s*\d+)?/gi, " ")
         .replace(/\s+/g, " ")
         .trim();
 }
@@ -3265,6 +3283,48 @@ function normalitzaTitol(t) {
         .trim();
 }
 
+// Ordena les carpetes candidates segons com encaixa el seu nom amb els
+// títols de la sèrie. Amb una sola carpeta no fa cap crida extra.
+async function ordenaCarpetesPerAfinitat(carpetes, titols, accessToken) {
+    if (!carpetes || carpetes.length <= 1) {
+        return (carpetes || []).map((id) => ({ id, score: 3 }));
+    }
+
+    const titolsNorm = (titols || []).map(normalitzaTitol).filter(Boolean);
+    const amb = [];
+    for (const id of carpetes) {
+        let nom = null;
+        if (quedaPressupost(4)) {
+            try {
+                const meta = await fetchFile(id, accessToken);
+                nom = meta?.name || null;
+            } catch (e) { /* si no el podem llegir, queda sense nom */ }
+        }
+        let score = 1;   // sense nom, prioritat baixa però no descartada
+        if (nom) {
+            const nets = cleanTitleForSearch(nom);
+            const variants = new Set(
+                [...nets.queries, nom]
+                    .filter((q) => q !== nets.curt)
+                    .map(normalitzaTitol)
+                    .filter(Boolean)
+            );
+            if (titolsNorm.some((t) => variants.has(t))) score = 3;
+            else if (esSerieGermana(nom, titolsNorm)) score = 0;   // és una altra sèrie
+            else score = 2;
+        }
+        amb.push({ id, nom, score });
+    }
+
+    amb.sort((a, b) => b.score - a.score);
+    console.log({
+        message: "Carpetes candidates ordenades per afinitat",
+        ordre: amb.map((x) => ({ nom: x.nom, score: x.score })),
+    });
+    // Les que són clarament una altra sèrie no es miren
+    return amb.filter((x) => x.score > 0);
+}
+
 async function findCollectionFolder(imdbId, accessToken) {
     if (IMDB_TO_GDRIVE.has(imdbId)) {
         const mapping = IMDB_TO_GDRIVE.get(imdbId);
@@ -3468,13 +3528,37 @@ async function getStreams(streamRequest) {
                 const estrategies = [];
                 let fitxersRevisats = 0;
 
-                for (const folderIdBrut of carpetes) {
+                // Quan una mateixa sèrie té diverses carpetes al mapa, pot ser
+                // que alguna hi sigui per error (l'exemple real: la carpeta
+                // "Inazuma Eleven Go" havia quedat associada també a l'ID
+                // d'"Inazuma Eleven"). Les ordenem per com de bé encaixa el seu
+                // nom amb els títols de la sèrie, i deixem de mirar quan ja
+                // tenim resultats d'una carpeta que hi encaixa de debò.
+                const carpetesOrdenades = await ordenaCarpetesPerAfinitat(
+                    carpetes, titolsSerie, accessToken
+                );
+
+                for (const { id: folderIdBrut, score: afinitat } of carpetesOrdenades) {
+                    // Si ja tenim resultats d'una carpeta que encaixa bé, no
+                    // seguim: la resta són probablement associacions errònies.
+                    if (trobats.length > 0 && afinitat < 3) break;
                     if (!quedaPressupost(6)) {
                         console.log({ message: "Sense pressupost per revisar la resta de carpetes", imdbId });
                         break;
                     }
-                    const folderId = await afinaCarpetaDeSerie(folderIdBrut, titolsSerie, accessToken);
-                    const fitxersRuta = await walkCollectionFiles(folderId, accessToken, 6, titolsSerie);
+                    // Una carpeta pot afinar-se en diverses subcarpetes quan
+                    // hi ha rellançaments de la mateixa sèrie. Les recorrem
+                    // totes i n'ajuntem els fitxers.
+                    const subcarpetes = await afinaCarpetaDeSerie(
+                        folderIdBrut, titolsSerie, accessToken
+                    );
+                    const fitxersRuta = [];
+                    for (const folderId of subcarpetes) {
+                        if (!quedaPressupost(6)) break;
+                        fitxersRuta.push(
+                            ...(await walkCollectionFiles(folderId, accessToken, 6, titolsSerie))
+                        );
+                    }
                     fitxersRevisats += fitxersRuta.length;
 
                     const { matches, estrategia } = trobaEpisodis(
