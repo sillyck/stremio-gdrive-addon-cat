@@ -25,6 +25,16 @@ const CARPETES = {
   ],
 };
 
+// Noms REALS de les carpetes (abans no es simulaven: qualsevol GET directe
+// d'un fitxer/carpeta requeia al mateix bloc de cerca i tornava {files:[]}
+// en lloc de {id,name,...}, així que ordenaCarpetesPerAfinitat mai trobava
+// el nom i totes les carpetes quedaven amb afinitat 1 — el test no exercia
+// de debò el cas real de "dues carpetes amb convencions diferents".
+const NOMS_CARPETA = {
+  F_A: "Inazuma Eleven T1xC",
+  F_B: "Inazuma Eleven (2008)",
+};
+
 let logs = [];
 const ctx = {
   console: { log: (o) => logs.push(o), error: (o) => logs.push(o) },
@@ -33,7 +43,23 @@ const ctx = {
     const s = String(u);
     if (s.includes("oauth2")) return { ok: true, json: async () => ({ access_token: "t" }) };
     if (s.includes("googleapis")) {
-      const q = new URL(s).searchParams.get("q") || "";
+      const url = new URL(s);
+      const q = url.searchParams.get("q") || "";
+      // GET directe d'un fitxer/carpeta concret (.../files/{id}, sense 'q'),
+      // que és el que fa fetchFile() per llegir el nom real d'una carpeta.
+      const midDirecte = !q && /\/files\/([^/?]+)/.exec(url.pathname);
+      if (midDirecte) {
+        const id = decodeURIComponent(midDirecte[1]);
+        if (NOMS_CARPETA[id]) {
+          return {
+            ok: true,
+            json: async () => ({
+              id, name: NOMS_CARPETA[id], mimeType: "application/vnd.google-apps.folder",
+            }),
+          };
+        }
+        return { ok: false, status: 404 };
+      }
       const fid = (/'([^']+)' in parents/.exec(q) || [])[1];
       let files = CARPETES[fid] || [];
       if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) files = [];

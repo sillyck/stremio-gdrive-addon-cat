@@ -81,6 +81,7 @@ const CONFIG = {
     // "Pelis" (té subcarpetes que són sèries, ex. Bola de Drac, One Piece) i
     // "Series" (unitat compartida "Animelliure t7").
     collectionsRootFolderIds: [
+        "1G8ZZTxqrsx1bU-oDf-IyLRnLUVPSxYo-", // Pelis (Bola de Drac, One Piece...)
         "1gFvLogJwAqobE_7Km4uC6zEkt-FyOEC3", // Series
     ],
     // Carpetes de les quals els arxius DIRECTES (no dins subcarpetes) es
@@ -130,6 +131,13 @@ function consumeix(n = 1) {
     return true;
 }
 function quedaPressupost(minim = 3) { return PRESSUPOST > minim; }
+
+// parseInt(x) || undefined convertia el valor 0 (vàlid: temporada 0 =
+// especials a Stremio) en undefined. Aquesta versió només descarta NaN.
+function numeroOUndefined(valor) {
+    const n = parseInt(valor, 10);
+    return Number.isNaN(n) ? undefined : n;
+}
 
 // ── Mapa persistent carpeta/fitxer → metadades ────────────────────────────
 // Tot el mapa es desa en UN sol objecte a la Cache API: llegir-lo costa una
@@ -1352,6 +1360,7 @@ async function imatgesPerImdb(imdbId) {
             tmdbId: r.id,
             tmdbType: data.movie_results?.length ? "movie" : "tv",
             title: r.title || r.name || null,
+            overview: r.overview || null,
         };
     } catch (e) {
         return null;
@@ -1503,6 +1512,7 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
                         tmdbId: art?.tmdbId || null,
                         tmdbType: art?.tmdbType || (preferTv ? "tv" : "movie"),
                         title: art?.title || viqui.title,
+                        overview: art?.overview || null,
                         score: 2,
                         font: "viquipedia:" + wiki,
                     };
@@ -1548,6 +1558,9 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
             tmdbId: result.id,
             tmdbType: result.media_type,
             title: result.name || result.title || null,
+            // Ja arriba dins la mateixa resposta de cerca (cap subpetició
+            // extra): abans es descartava i la fitxa quedava sense sinopsi.
+            overview: result.overview || null,
             score: millor.score,
         };
         TMDB_CACHE.set(cacheKey, out);
@@ -1703,6 +1716,13 @@ async function fetchFiles(fetchUrl, accessToken) {
 }
 
 async function fetchFile(fileId, accessToken) {
+    // Es fa la crida igualment encara que no quedi pressupost — sovint és el
+    // pas final per servir un stream i bloquejar-la seria pitjor que
+    // saltar-nos-el. Però SÍ que la comptem, perquè les altres funcions que
+    // consulten quedaPressupost() abans de fer una crida opcional (pòsters,
+    // resolució de noms...) vegin l'espai real que queda i no arrisquin
+    // superar el límit real de subpeticions de Cloudflare.
+    consumeix(1);
     try {
         const fetchUrl = new URL(
             API_ENDPOINTS.DRIVE_FETCH_FILE.replace("{fileId}", fileId)
@@ -2800,9 +2820,9 @@ async function handleRequest(request) {
                     if (!quedaPressupost(8)) { pendents++; continue; }
                     const r = await getTmdbPosterByName(folder.name, { preferTv: true });
                     escriuMapa("s:" + folder.id, r?.imdbId
-                        ? { imdbId: r.imdbId, poster: r.poster, background: r.background, title: r.title }
+                        ? { imdbId: r.imdbId, poster: r.poster, background: r.background, title: r.title, overview: r.overview || null }
                         : { imdbId: null, poster: r?.poster || null, background: r?.background || null,
-                            title: r?.title || null, intents: (previ?.intents || 0) + 1 });
+                            title: r?.title || null, overview: null, intents: (previ?.intents || 0) + 1 });
                     resoltes++;
                 }
             }
@@ -2824,9 +2844,9 @@ async function handleRequest(request) {
                     if (!quedaPressupost(8)) { pendents++; continue; }
                     const r = await getTmdbPosterByName(file.name);
                     escriuMapa("m:" + file.id, r?.imdbId
-                        ? { imdbId: r.imdbId, poster: r.poster, background: r.background, title: r.title }
+                        ? { imdbId: r.imdbId, poster: r.poster, background: r.background, title: r.title, overview: r.overview || null }
                         : { imdbId: null, poster: r?.poster || null, background: r?.background || null,
-                            title: r?.title || null, intents: (previ?.intents || 0) + 1 });
+                            title: r?.title || null, overview: null, intents: (previ?.intents || 0) + 1 });
                     resoltes++;
                 }
             }
@@ -2857,6 +2877,7 @@ async function handleRequest(request) {
                                 poster: r?.poster || null,
                                 background: r?.background || null,
                                 title: r?.title || null,
+                                overview: r?.overview || null,
                                 deColeccio: true,
                                 nom: p.file.name,
                                 mida: p.file.size || 0,
@@ -2985,13 +3006,23 @@ ${acabat
             if (!dades && permetResoldre && quedaPressupost(6)) {
                 const tmdb = await getTmdbPosterByName(name);
                 dades = tmdb
-                    ? { imdbId: tmdb.imdbId, poster: tmdb.poster, background: tmdb.background, title: tmdb.title }
-                    : { imdbId: null, poster: null, background: null, title: null };
+                    ? {
+                        imdbId: tmdb.imdbId, poster: tmdb.poster, background: tmdb.background,
+                        title: tmdb.title, overview: tmdb.overview || null,
+                    }
+                    : { imdbId: null, poster: null, background: null, title: null, overview: null };
                 escriuMapa("m:" + id, dades);
             }
             if (dades?.imdbId) {
                 IMDB_TO_GDRIVE.set(dades.imdbId, { type: "movie", id });
             }
+            const detalls =
+                `Mida: ${formatSize(size)}` +
+                (createdTime
+                    ? ` · Afegit: ${new Date(createdTime).toLocaleDateString("ca-ES", {
+                          year: "numeric", month: "long", day: "numeric",
+                      })}`
+                    : "");
             return {
                 id: dades?.imdbId ? dades.imdbId : `gdrive:${id}`,
                 name: dades?.title || name,
@@ -2999,13 +3030,11 @@ ${acabat
                 posterShape: "poster",
                 poster: dades?.poster || posterGenerat(dades?.title || name),
                 background: dades?.background || thumbnail || null,
-                description:
-                    `Mida: ${formatSize(size)}` +
-                    (createdTime
-                        ? ` · Afegit: ${new Date(createdTime).toLocaleDateString("ca-ES", {
-                              year: "numeric", month: "long", day: "numeric",
-                          })}`
-                        : ""),
+                // La sinopsi de TMDB primer (si en tenim), i les dades del
+                // fitxer sempre com a segona línia — abans la descripció
+                // només era mida/data, encara que la sinopsi ja s'havia
+                // demanat a TMDB per la resta de metadades.
+                description: dades?.overview ? `${dades.overview}\n\n${detalls}` : detalls,
             };
         };
 
@@ -3016,7 +3045,7 @@ ${acabat
                     message: "Failed to extract file ID",
                     error: "File ID is undefined",
                 });
-                return null;
+                return createJsonResponse({ meta: null }, 400);
             }
 
             if (fullMetaId.startsWith("gdriveshow:")) {
@@ -3027,7 +3056,7 @@ ${acabat
                         message: "Failed to get access token",
                         error: "Access token is undefined",
                     });
-                    return null;
+                    return createJsonResponse({ meta: null }, 502);
                 }
                 console.log({ message: "Collection meta request", folderId });
                 let folderInfo;
@@ -3058,12 +3087,21 @@ ${acabat
                     folderId,
                     numVideos: videos.length,
                 });
+                // El catàleg (gdrive_collections) ja resol pòster/sinopsi via
+                // TMDB i ho desa a "s:<folderId>" — abans aquesta pantalla de
+                // detall no ho reaprofitava i sempre sortia sense pòster ni
+                // descripció, encara que la graella sí que en tingués.
+                const nomBase = folderInfo?.name || "Col·lecció";
+                const dades = llegeixMapa("s:" + folderId);
                 return createJsonResponse({
                     meta: {
                         id: fullMetaId,
                         type: "series",
-                        name: folderInfo?.name || "Col·lecció",
+                        name: dades?.title || nomBase,
                         posterShape: "poster",
+                        poster: dades?.poster || posterGenerat(dades?.title || nomBase),
+                        background: dades?.background || null,
+                        description: dades?.overview || undefined,
                         videos,
                     },
                 });
@@ -3076,7 +3114,7 @@ ${acabat
                     message: "Failed to get access token",
                     error: "Access token is undefined",
                 });
-                return null;
+                return createJsonResponse({ meta: null }, 502);
             }
             console.log({ message: "Meta request", fullMetaId, gdriveId });
             const file = await fetchFile(gdriveId, accessToken);
@@ -3085,7 +3123,7 @@ ${acabat
                     message: "Failed to fetch file",
                     error: "File is undefined",
                 });
-                return null;
+                return createJsonResponse({ meta: null }, 404);
             }
             console.log({ message: "File fetched", file });
             const parsedFile = parseFile(file);
@@ -3145,8 +3183,11 @@ ${acabat
                     if (!quedaPressupost(6)) break;
                     const tmdb = await getTmdbPosterByName(folder.name, { preferTv: true });
                     const dades = tmdb
-                        ? { imdbId: tmdb.imdbId, poster: tmdb.poster, background: tmdb.background, title: tmdb.title }
-                        : { imdbId: null, poster: null, background: null, title: null };
+                        ? {
+                            imdbId: tmdb.imdbId, poster: tmdb.poster, background: tmdb.background,
+                            title: tmdb.title, overview: tmdb.overview || null,
+                        }
+                        : { imdbId: null, poster: null, background: null, title: null, overview: null };
                     escriuMapa("s:" + folder.id, dades);
                     jaResoltes.push({ folder, dades });
                     resoltesAra++;
@@ -3269,7 +3310,9 @@ ${acabat
                         posterShape: "poster",
                         poster: v.poster || posterGenerat(v.title || v.nom),
                         background: v.background || null,
-                        description: v.mida ? `Mida: ${formatSize(v.mida)}` : undefined,
+                        description: v.overview
+                            ? (v.mida ? `${v.overview}\n\nMida: ${formatSize(v.mida)}` : v.overview)
+                            : (v.mida ? `Mida: ${formatSize(v.mida)}` : undefined),
                     });
                     deColeccions++;
                 }
@@ -3355,7 +3398,7 @@ ${acabat
             season = 1;
         }
 
-        if (fullId.startsWith("gdrive")) {
+        if (fullId.startsWith("gdrive:")) {
             const fileId = streamMatch[2].split(":")[1];
             const accessToken = await getAccessToken();
             if (!accessToken) {
@@ -3363,7 +3406,9 @@ ${acabat
                     message: "Failed to get access token",
                     error: "Access token is undefined",
                 });
-                return null;
+                return createJsonResponse({
+                    streams: [createErrorStream("No s'ha pogut obtenir accés a Google Drive (token caducat o revocat)")],
+                });
             }
 
             const file = await fetchFile(fileId, accessToken);
@@ -3372,7 +3417,9 @@ ${acabat
                     message: "Failed to fetch file",
                     error: "File is undefined",
                 });
-                return null;
+                return createJsonResponse({
+                    streams: [createErrorStream("Aquest fitxer ja no existeix a Google Drive (esborrat o mogut)")],
+                });
             }
 
             const parsedFile = parseFile(file);
@@ -3394,8 +3441,12 @@ ${acabat
         const parsedStreamRequest = {
             type: type,
             id: fullId,
-            season: parseInt(season) || undefined,
-            episode: parseInt(episode) || undefined,
+            // NO usar "|| undefined": la temporada 0 (especials, a Stremio)
+            // és un valor vàlid i "0 || undefined" el convertia en undefined,
+            // fent que aquestes peticions caiguessin sempre pel camí vell de
+            // cerca de text en lloc del motor detectaEsquema/trobaEpisodis.
+            season: numeroOUndefined(season),
+            episode: numeroOUndefined(episode),
             metadata: metadata,
         };
 
@@ -3758,7 +3809,7 @@ async function getStreams(streamRequest) {
     }
 
     // ── SÈRIES ────────────────────────────────────────────────────────────
-    if (esImdb && streamRequest.season && streamRequest.episode) {
+    if (esImdb && streamRequest.season != null && streamRequest.episode != null) {
         try {
             const accessToken = await getAccessToken();
             if (accessToken) {
@@ -3796,6 +3847,14 @@ async function getStreams(streamRequest) {
                 const trobats = [];      // { parsed, titol }
                 const estrategies = [];
                 let fitxersRevisats = 0;
+                // Només ens fiem prou per deixar de mirar carpetes quan ja
+                // tenim resultats d'una carpeta amb afinitat 3 (nom
+                // confirmat). Si cap carpeta ha arribat a 3 (per exemple
+                // perquè no s'ha pogut llegir el nom de cap, o cap encaixa
+                // prou bé), NO parem: és exactament el cas de dues carpetes
+                // legítimes amb convencions de nom diferents per la mateixa
+                // sèrie, el que aquest bucle ha d'agregar, no descartar.
+                let millorAfinitatAmbResultats = -1;
 
                 // Quan una mateixa sèrie té diverses carpetes al mapa, pot ser
                 // que alguna hi sigui per error (l'exemple real: la carpeta
@@ -3808,9 +3867,12 @@ async function getStreams(streamRequest) {
                 );
 
                 for (const { id: folderIdBrut, score: afinitat } of carpetesOrdenades) {
-                    // Si ja tenim resultats d'una carpeta que encaixa bé, no
-                    // seguim: la resta són probablement associacions errònies.
-                    if (trobats.length > 0 && afinitat < 3) break;
+                    // Si ja tenim resultats d'una carpeta que encaixa bé DE
+                    // DEBÒ (afinitat 3, nom confirmat), no seguim: la resta
+                    // són probablement associacions errònies. Amb resultats
+                    // però sense cap confirmació de nom (afinitat < 3),
+                    // seguim mirant — podria ser una segona carpeta legítima.
+                    if (millorAfinitatAmbResultats === 3 && afinitat < 3) break;
                     if (!quedaPressupost(6)) {
                         console.log({ message: "Sense pressupost per revisar la resta de carpetes", imdbId });
                         break;
@@ -3842,6 +3904,7 @@ async function getStreams(streamRequest) {
                             titol: titolEpisodiDeNom(m.nomArxiu, titolsSerie),
                         });
                     }
+                    if (afinitat > millorAfinitatAmbResultats) millorAfinitatAmbResultats = afinitat;
                 }
 
                 if (trobats.length > 0) {
@@ -3892,7 +3955,7 @@ async function getStreams(streamRequest) {
     }
 
     // ── PEL·LÍCULES ───────────────────────────────────────────────────────
-    if (esImdb && !streamRequest.season && !streamRequest.episode) {
+    if (esImdb && streamRequest.season == null && streamRequest.episode == null) {
         try {
             const accessToken = await getAccessToken();
             if (accessToken) {
@@ -4023,9 +4086,16 @@ export default {
         // Cada invocació parteix del pressupost de subpeticions del pla
         // gratuït (50). En deixem 4 de marge per als imprevistos.
         reiniciaPressupost(46);
-        MAPA = null;
-        MAPA_BRUT = false;
-        INDEX_INVERS = null;
+        // IMPORTANT: NO reiniciem MAPA/MAPA_BRUT/INDEX_INVERS aquí. Abans es
+        // feia i tenia dos efectes dolents: (1) cada petició pagava una
+        // subpetició per recarregar el mapa del cau encara que ja estigués
+        // calent a l'isolate (carregaMapa() ja fa lazy-load si és null, no
+        // cal forçar-ho), i (2) si Cloudflare processa dues peticions
+        // concurrents al mateix isolate (normal amb Stremio, que llança
+        // catàleg+meta+stream gairebé alhora), la petició que arriba després
+        // esborrava el mapa que l'altra encara estava fent servir a mig
+        // procés. Deixem que persisteixi entre invocacions de l'isolate;
+        // només es buida explícitament des de /purga.
         globalThis.__ctx = ctx;
 
         return handleRequest(request);
