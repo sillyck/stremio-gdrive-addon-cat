@@ -388,13 +388,39 @@ async function carrega() {
           '<button data-accio="cerca">Cerca</button>' +
           '<button data-accio="esborra" style="background:#3a1a1a">Descarta</button>' +
         '</div>' +
+        '<div class="cerca-row">' +
+          '<input type="text" data-imdb placeholder="o enganxa l\\'IMDb ID directe (tt1234567)...">' +
+          '<button data-accio="assigna-imdb">Assigna per ID</button>' +
+        '</div>' +
         '<div class="resultats"></div>' +
       '</div>';
     const input = div.querySelector('input');
+    const inputImdb = div.querySelector('[data-imdb]');
     const resultatsDiv = div.querySelector('.resultats');
     div.querySelector('[data-accio="cerca"]').onclick = () => cercaTmdb(p, input.value, resultatsDiv);
     div.querySelector('[data-accio="esborra"]').onclick = async () => {
       await fetch('/esborra?clau=' + encodeURIComponent(p.clau));
+      div.remove();
+    };
+    div.querySelector('[data-accio="assigna-imdb"]').onclick = async () => {
+      const btn = div.querySelector('[data-accio="assigna-imdb"]');
+      const valor = inputImdb.value.trim();
+      if (!/^tt\\d+$/.test(valor)) {
+        alert('Ha de començar per "tt" seguit de números, ex. tt0088509 (el trobes a la URL de la fitxa a imdb.com)');
+        return;
+      }
+      btn.textContent = 'Assignant...';
+      const r = await fetch('/admin/assignaImdb', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clau: p.clau, imdbId: valor }),
+      });
+      const d2 = await r.json();
+      if (!r.ok) {
+        alert('Error: ' + (d2.error || r.status));
+        btn.textContent = 'Assigna per ID';
+        return;
+      }
       div.remove();
     };
     cont.appendChild(div);
@@ -3382,6 +3408,44 @@ ${acabat
                 });
                 await desaMapa(globalThis.__ctx);
                 return createJsonResponse({ ok: true, imdbId: ext.imdb_id || null, title: detall.name || detall.title });
+            } catch (e) {
+                return createJsonResponse({ error: e.toString() }, 500);
+            }
+        }
+
+        // Assignació directa per IMDb ID (tt1234567), sense passar per la
+        // cerca de text de TMDB — per als títols que la cerca no troba de
+        // cap manera (traduccions massa lliures, franquícies confuses...)
+        // però dels quals ja saps l'ID real, per exemple mirant-lo a IMDb.
+        if (url.pathname === "/admin/assignaImdb" && request.method === "POST") {
+            let body;
+            try { body = await request.json(); } catch (e) {
+                return createJsonResponse({ error: "JSON invàlid" }, 400);
+            }
+            const { clau, imdbId } = body || {};
+            if (!clau || !imdbId || !/^tt\d+$/.test(imdbId)) {
+                return createJsonResponse({ error: "Calen clau i un imdbId vàlid (tt1234567)" }, 400);
+            }
+            if (!CONFIG.tmdbApiKey) return createJsonResponse({ error: "Sense TMDB_API_KEY" }, 500);
+            try {
+                const art = await imatgesPerImdb(imdbId);
+                if (!art) {
+                    return createJsonResponse({ error: "TMDB no reconeix aquest IMDb ID" }, 404);
+                }
+                await carregaMapa();
+                const previ = llegeixMapa(clau);
+                const ids = previ?.ids || clau.slice(2).split("+").filter(Boolean);
+                escriuMapa(clau, {
+                    imdbId,
+                    poster: art.poster || `https://btttr.cc/poster-n/imdb/poster-default/${imdbId}.jpg`,
+                    background: art.background || null,
+                    title: art.title || null,
+                    overview: art.overview || null,
+                    ids,
+                    assignatAMa: true,
+                });
+                await desaMapa(globalThis.__ctx);
+                return createJsonResponse({ ok: true, imdbId, title: art.title });
             } catch (e) {
                 return createJsonResponse({ error: e.toString() }, 500);
             }
