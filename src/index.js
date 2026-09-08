@@ -3084,53 +3084,6 @@ async function handleRequest(request) {
         // Diu quina versió del codi s'està executant realment. Serveix per
         // saber d'un cop d'ull si un desplegament ha arribat de debò o si
         // encara s'executa una versió antiga.
-        // Diagnòstic temporal: llistat cru de "Pelis" tal com el veu Drive,
-        // sense passar per dedupMetas ni per la resolució TMDB, per poder
-        // comparar-lo directament amb el que es veu al navegador de Drive.
-        if (url.pathname === "/debug/pelis") {
-            const accessToken = await getAccessToken();
-            if (!accessToken) return createJsonResponse({ error: "sense accessToken" }, 502);
-            const movieFolderIds = CONFIG.moviesFolderIds?.length ? CONFIG.moviesFolderIds : CONFIG.driveFolderIds;
-            const parts = ["trashed=false", "mimeType contains 'video/'"];
-            if (movieFolderIds?.length) {
-                parts.push(`(${movieFolderIds.map((id) => `'${id}' in parents`).join(" or ")})`);
-            }
-            const fetchUrl = new URL(API_ENDPOINTS.DRIVE_FETCH_FILES);
-            fetchUrl.search = new URLSearchParams({
-                q: parts.join(" and "),
-                corpora: "allDrives",
-                includeItemsFromAllDrives: "true",
-                supportsAllDrives: "true",
-                pageSize: "1000",
-                orderBy: "name_natural",
-                fields: "nextPageToken,incompleteSearch,files(id,name)",
-            }).toString();
-            const results = await fetchFiles(fetchUrl, accessToken);
-
-            // Segona consulta, SENSE el filtre "mimeType contains 'video/'",
-            // per veure si hi ha fitxers que Drive no classifica com a vídeo.
-            const fetchUrlSense = new URL(API_ENDPOINTS.DRIVE_FETCH_FILES);
-            fetchUrlSense.search = new URLSearchParams({
-                q: `trashed=false and (${movieFolderIds.map((id) => `'${id}' in parents`).join(" or ")})`,
-                corpora: "allDrives",
-                includeItemsFromAllDrives: "true",
-                supportsAllDrives: "true",
-                pageSize: "1000",
-                orderBy: "name_natural",
-                fields: "nextPageToken,incompleteSearch,files(id,name,mimeType)",
-            }).toString();
-            const resultsSense = await fetchFiles(fetchUrlSense, accessToken);
-            const noVideo = resultsSense.files.filter((f) => !(f.mimeType || "").includes("video/"));
-
-            return createJsonResponse({
-                movieFolderIds,
-                ambFiltreVideo: { total: results.files.length, incompleteSearch: results.incompleteSearch || false },
-                senseFiltreVideo: { total: resultsSense.files.length, incompleteSearch: resultsSense.incompleteSearch || false },
-                exclososPelMimeType: noVideo.map((f) => ({ nom: f.name, mimeType: f.mimeType })),
-                pressupostRestant: PRESSUPOST,
-            });
-        }
-
         if (url.pathname === "/versio") {
             const mapa = await carregaMapa();
             const total = Object.keys(mapa || {}).filter((k) => !k.startsWith("__")).length;
