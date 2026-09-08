@@ -93,7 +93,7 @@ const CONFIG = {
 
 // Identificador de la versió del codi. Serveix per verificar via /versio
 // quina versió s'està executant realment al worker.
-const VERSIO_CODI = "2026-09-07.versio-informa-de-pelis";
+const VERSIO_CODI = "2026-09-08.fixos-pelis-nulls-temporada0-mapa";
 
 const MANIFEST = {
     id: "stremio.gdrive.worker.cat",
