@@ -149,23 +149,40 @@ function ambEtiquetaCat(nom) {
 }
 
 // ── Mapa persistent carpeta/fitxer → metadades ────────────────────────────
-// Tot el mapa es desa en UN sol objecte a la Cache API: llegir-lo costa una
-// única subpetició en comptes d'una per títol, que és el que feia inviable
-// resoldre el catàleg sencer dins dels límits.
+// Preferim el KV natiu de Workers (globalThis.__env.MAPA_KV, vinculat des
+// de wrangler.toml) quan hi és — és un magatzem fet expressament per a
+// això, no un efecte secundari de la Cache API HTTP. Si encara no s'ha
+// creat/vinculat cap namespace KV (o l'entorn no en suporta, com els tests
+// via Node vm), es cau al mètode anterior amb la Cache API perquè
+// l'addon segueixi funcionant sense necessitat de tocar res més.
 const MAPA_URL = "https://gdrive-addon.local/__mapa_v1";
+const MAPA_KV_KEY = "mapa_v1";
 let MAPA = null;          // { [clau]: { imdbId, poster, background, title, ts } }
 let MAPA_BRUT = false;    // hi ha canvis pendents de desar?
+
+function kvMapa() {
+    return globalThis.__env?.MAPA_KV || null;
+}
 
 async function carregaMapa() {
     if (MAPA) return MAPA;
     MAPA = {};
+    const kv = kvMapa();
     try {
+        if (kv) {
+            const dades = await kv.get(MAPA_KV_KEY, "json");
+            if (dades) {
+                MAPA = dades;
+                console.log({ message: "Mapa carregat (KV)", entrades: Object.keys(MAPA).length });
+            }
+            return MAPA;
+        }
         if (typeof caches === "undefined") return MAPA;
         if (!consumeix(1)) return MAPA;
         const resposta = await caches.default.match(new Request(MAPA_URL));
         if (resposta) {
             MAPA = await resposta.json();
-            console.log({ message: "Mapa carregat", entrades: Object.keys(MAPA).length });
+            console.log({ message: "Mapa carregat (Cache API, sense KV vinculat)", entrades: Object.keys(MAPA).length });
         }
     } catch (e) {
         console.error({ message: "No s'ha pogut carregar el mapa", error: e.toString() });
@@ -175,7 +192,14 @@ async function carregaMapa() {
 
 async function desaMapa(ctx) {
     if (!MAPA_BRUT || !MAPA) return;
+    const kv = kvMapa();
     try {
+        if (kv) {
+            const promesa = kv.put(MAPA_KV_KEY, JSON.stringify(MAPA));
+            if (ctx?.waitUntil) ctx.waitUntil(promesa); else await promesa;
+            MAPA_BRUT = false;
+            return;
+        }
         if (typeof caches === "undefined") return;
         const resposta = new Response(JSON.stringify(MAPA), {
             headers: {
@@ -2909,6 +2933,7 @@ async function handleRequest(request) {
                     };
                 })(),
                 cauRecorregut: CONFIG.usaCauRecorregut ? "actiu" : "desactivat (proves)",
+                emmagatzematgeMapa: kvMapa() ? "KV" : "Cache API (sense KV vinculat)",
             });
         }
 
@@ -3111,7 +3136,12 @@ ${acabat
 
         // Buida el mapa (per si vols refer-lo de zero)
         if (url.pathname === "/buidar") {
-            try { await caches.default.delete(new Request(MAPA_URL)); } catch (e) {}
+            const kv = kvMapa();
+            if (kv) {
+                try { await kv.delete(MAPA_KV_KEY); } catch (e) {}
+            } else {
+                try { await caches.default.delete(new Request(MAPA_URL)); } catch (e) {}
+            }
             // Des que MAPA ja no es reinicia a cada petició (per no gastar
             // una subpetició de més i per no trencar peticions concurrents),
             // buidar només la còpia persistent no basta: si l'isolate que
@@ -4290,6 +4320,7 @@ export default {
         // procés. Deixem que persisteixi entre invocacions de l'isolate;
         // només es buida explícitament des de /purga.
         globalThis.__ctx = ctx;
+        globalThis.__env = env;
 
         return handleRequest(request);
     },
@@ -4304,6 +4335,7 @@ export default {
         CREDENTIALS.refreshToken = CREDENTIALS.refreshToken || env.REFRESH_TOKEN;
         CONFIG.tmdbApiKey = CONFIG.tmdbApiKey || env.TMDB_API_KEY;
         globalThis.__ctx = ctx;
+        globalThis.__env = env;
 
         const PASSADES = 8;
         for (let i = 0; i < PASSADES; i++) {
