@@ -2982,6 +2982,15 @@ ${acabat
         // Buida el mapa (per si vols refer-lo de zero)
         if (url.pathname === "/buidar") {
             try { await caches.default.delete(new Request(MAPA_URL)); } catch (e) {}
+            // Des que MAPA ja no es reinicia a cada petició (per no gastar
+            // una subpetició de més i per no trencar peticions concurrents),
+            // buidar només la còpia persistent no basta: si l'isolate que
+            // atén AQUESTA petició ja tenia el mapa calent en memòria,
+            // el seguiria fent servir tal qual i /buidar no tindria cap
+            // efecte visible fins que Cloudflare reciclés l'isolate tot sol.
+            MAPA = null;
+            MAPA_BRUT = false;
+            INDEX_INVERS = null;
             return createJsonResponse({ missatge: "Mapa esborrat." });
         }
 
