@@ -3351,7 +3351,14 @@ ${acabat
         if (url.pathname === "/admin/dades") {
             const mapa = await carregaMapa(true);
             const pendents = Object.entries(mapa || {})
-                .filter(([clau, v]) => !clau.startsWith("__") && !v?.imdbId)
+                // "pendent" vol dir sense resoldre DE CAP MANERA. Abans
+                // només mirava imdbId, així que un títol assignat a mà
+                // (/admin/assigna o /admin/assignaImdb) que TMDB no té
+                // enllaçat a cap IMDb ID (habitual amb sèries doblades poc
+                // conegudes) es quedava per sempre a la llista de pendents
+                // encara que ja s'hagués triat correctament — semblava que
+                // "no desapareixia" tot i haver-lo resolt bé.
+                .filter(([clau, v]) => !clau.startsWith("__") && !v?.imdbId && !v?.assignatAMa)
                 .map(([clau, v]) => ({
                     clau,
                     nom: v?.title || v?.nom || clau.slice(2).split("+")[0],
