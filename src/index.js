@@ -183,8 +183,14 @@ function kvMapa() {
     return globalThis.__env?.MAPA_KV || null;
 }
 
-async function carregaMapa() {
-    if (MAPA) return MAPA;
+async function carregaMapa(forcar = false) {
+    // "forcar" salta la còpia calenta en memòria i llegeix sempre la
+    // persistent. Necessari a /admin: si dues peticions van a isolates
+    // diferents (habitual amb trànsit real), la que llista pendents pot
+    // tenir en memòria una còpia més vella que la que ha desat una altra
+    // acció d'assignació fa un moment — i mostrar com a pendent un títol
+    // que ja s'ha resolt.
+    if (MAPA && !forcar) return MAPA;
     MAPA = {};
     const kv = kvMapa();
     try {
@@ -445,11 +451,17 @@ async function cercaTmdb(p, query, resultatsDiv) {
       '<button>Tria aquest</button>';
     row.querySelector('button').onclick = async () => {
       row.querySelector('button').textContent = 'Desant...';
-      await fetch('/admin/assigna', {
+      const r = await fetch('/admin/assigna', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ clau: p.clau, tmdbId: res.tmdbId, tipus: p.tipus }),
       });
+      if (!r.ok) {
+        const d2 = await r.json().catch(() => ({}));
+        alert('Error desant: ' + (d2.error || r.status));
+        row.querySelector('button').textContent = 'Tria aquest';
+        return;
+      }
       row.closest('.pendent').remove();
     };
     resultatsDiv.appendChild(row);
@@ -3337,7 +3349,7 @@ ${acabat
         }
 
         if (url.pathname === "/admin/dades") {
-            const mapa = await carregaMapa();
+            const mapa = await carregaMapa(true);
             const pendents = Object.entries(mapa || {})
                 .filter(([clau, v]) => !clau.startsWith("__") && !v?.imdbId)
                 .map(([clau, v]) => ({
@@ -3394,7 +3406,12 @@ ${acabat
                 const [detallRes, extRes] = await Promise.all([fetch(detallUrl), fetch(extUrl)]);
                 const detall = await detallRes.json();
                 const ext = extRes.ok ? await extRes.json() : {};
-                await carregaMapa();
+                // Forcem la recàrrega abans d'escriure: si no ho féssim,
+                // aquest isolate podria tenir en memòria una còpia del mapa
+                // més vella que la persistent (per una escriptura feta per
+                // un altre isolate mentrestant) i desaMapa() la sobreescriuria
+                // sencera, esborrant aquella altra assignació.
+                await carregaMapa(true);
                 const previ = llegeixMapa(clau);
                 const ids = previ?.ids || [clau.slice(2)].flatMap((s) => s.split("+"));
                 escriuMapa(clau, {
@@ -3432,7 +3449,10 @@ ${acabat
                 if (!art) {
                     return createJsonResponse({ error: "TMDB no reconeix aquest IMDb ID" }, 404);
                 }
-                await carregaMapa();
+                // Mateix motiu que a /admin/assigna: forcem la recàrrega
+                // perquè aquest isolate no sobreescrigui el mapa persistent
+                // amb una còpia en memòria desactualitzada.
+                await carregaMapa(true);
                 const previ = llegeixMapa(clau);
                 const ids = previ?.ids || clau.slice(2).split("+").filter(Boolean);
                 escriuMapa(clau, {
