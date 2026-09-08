@@ -6,3 +6,12 @@ preview_urls = true
 compatibility_flags = [ "nodejs_compat" ]
 [observability.logs]
 enabled = true
+
+# Cron Trigger: crida scheduled() cada dia. Cloudflare sempre interpreta
+# l'horari en UTC (no admet zones horàries) — "0 3 * * *" són les 04:00 a
+# Madrid a l'hivern (CET, UTC+1) i les 05:00 a l'estiu (CEST, UTC+2). No hi
+# ha manera de fer-ho exacte a les 4h tot l'any sense dos crons + lògica
+# per triar quin toca segons l'època, cosa que no calia per una tasca de
+# manteniment com aquesta.
+[triggers]
+crons = ["0 3 * * *"]

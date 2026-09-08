@@ -4293,4 +4293,27 @@ export default {
 
         return handleRequest(request);
     },
+
+    // Cron Trigger (wrangler.toml: [triggers] crons). Fa unes quantes
+    // passades d'/omplir seguides, reaprofitant exactament la mateixa
+    // lògica que l'endpoint manual — així el catàleg es va completant sol
+    // sense que calgui recordar de cridar /omplir a mà.
+    async scheduled(event, env, ctx) {
+        CREDENTIALS.clientId = CREDENTIALS.clientId || env.CLIENT_ID;
+        CREDENTIALS.clientSecret = CREDENTIALS.clientSecret || env.CLIENT_SECRET;
+        CREDENTIALS.refreshToken = CREDENTIALS.refreshToken || env.REFRESH_TOKEN;
+        CONFIG.tmdbApiKey = CONFIG.tmdbApiKey || env.TMDB_API_KEY;
+        globalThis.__ctx = ctx;
+
+        const PASSADES = 8;
+        for (let i = 0; i < PASSADES; i++) {
+            reiniciaPressupost(46);
+            try {
+                await handleRequest(new Request("https://gdrive-addon.local/omplir"));
+            } catch (e) {
+                console.error({ message: "Error en /omplir programat", passada: i, error: e.toString() });
+            }
+        }
+        console.log({ message: "Reompliment programat completat", passades: PASSADES, cron: event.cron });
+    },
 };
