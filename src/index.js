@@ -2121,6 +2121,93 @@ async function afinaCarpetaDeSerie(rootFolderId, titols, accessToken) {
     return millors.map((c) => c.sub.id);
 }
 
+// Detecta si una carpeta arrel és en realitat un CONTENIDOR DE FRANQUÍCIA
+// (té diverses sèries DIFERENTS a dins, ex. "Bola de Drac" amb "Bola de
+// Drac Z"/"GT"/"Kai"/"Z Kai" com a subcarpetes pròpies) i, si ho és, agrupa
+// les seves subcarpetes en un clúster per cada sèrie realment diferent —
+// les variants de qualitat/rip d'una mateixa sèrie ("Bola de Drac [Bluray]"
+// i "Bola de Drac [cat jap]") queden juntes al mateix clúster. Si no ho és
+// (una sèrie normal, o només variants d'una mateixa sèrie sense sufix propi),
+// retorna null i qui crida tracta la carpeta arrel sencera com abans.
+//
+// Abans, el catàleg només creava UNA entrada per carpeta arrel: "Bola de
+// Drac Z/GT/Kai" mai apareixien com a sèries pròpies, encara que hi fossin
+// al Drive — quedaven amagades dins d'una única entrada "Bola de Drac".
+async function detectaFranquicia(rootFolderId, accessToken) {
+    if (!quedaPressupost(6)) return null;
+    let subcarpetes;
+    try {
+        subcarpetes = await listChildren(rootFolderId, accessToken, { onlyFolders: true });
+    } catch (e) {
+        return null;
+    }
+    const utils = subcarpetes.filter((f) => !esCarpetaDExtres(f.name));
+    if (utils.length < 2) return null;
+
+    const titolNet = (nom) => {
+        const nets = cleanTitleForSearch(nom);
+        const variants = [...nets.queries, nom].filter((q) => q !== nets.curt);
+        return normalitzaTitol(variants[0] || nom);
+    };
+
+    const ordenats = utils
+        .map((f) => ({ f, titol: titolNet(f.name) }))
+        .filter((x) => x.titol);
+    if (ordenats.length < 2) return null;
+    // El títol normalitzat MÉS CURT és, per construcció, el de la sèrie
+    // "base" (sense cap sufix de divisió) — la resta es comparen contra ell.
+    ordenats.sort((a, b) => a.titol.length - b.titol.length);
+
+    const clusters = [{ titol: ordenats[0].titol, carpetes: [ordenats[0].f] }];
+    for (const item of ordenats.slice(1)) {
+        const exacte = clusters.find((c) => c.titol === item.titol);
+        if (exacte) {
+            exacte.carpetes.push(item.f);
+            continue;
+        }
+        // Comparem NOMÉS contra el clúster base (el títol més curt/net),
+        // que és l'única comparació fiable — comparar dues subcarpetes
+        // "sufixades" entre elles (ex. "GT" contra "Kai") no distingeix si
+        // són la mateixa sèrie o no, perquè cap conté l'altra com a prefix.
+        if (esSerieGermana(item.f.name, [clusters[0].titol])) {
+            clusters.push({ titol: item.titol, carpetes: [item.f] });
+        } else {
+            clusters[0].carpetes.push(item.f);
+        }
+    }
+
+    if (clusters.length < 2) return null;
+    return clusters.map((c) => ({
+        ids: c.carpetes.map((x) => x.id),
+        nom: c.carpetes[0].name,
+    }));
+}
+
+// Retorna la llista "aplanada" d'entrades de catàleg per una carpeta arrel
+// de col·leccions: normalment una entrada per subcarpeta directa, però quan
+// detectaFranquicia() hi troba diverses sèries a dins, una entrada per
+// cadascuna (amb tots els ids de carpeta que li pertanyen).
+async function obtenirEntradesDeColleccio(rootId, accessToken) {
+    let carpetes = [];
+    try {
+        carpetes = await listChildren(rootId, accessToken, { onlyFolders: true });
+    } catch (e) {
+        return [];
+    }
+    const entrades = [];
+    for (const folder of carpetes) {
+        const franquicia = await detectaFranquicia(folder.id, accessToken);
+        if (franquicia) {
+            for (const f of franquicia) {
+                entrades.push({ ids: f.ids, nom: f.nom, clau: "s:" + f.ids.join("+") });
+            }
+        } else {
+            entrades.push({ ids: [folder.id], nom: folder.name, clau: "s:" + folder.id });
+        }
+    }
+    return entrades;
+}
+
 async function walkCollectionFiles(rootFolderId, accessToken, maxDepth = 6, titolsSerie = []) {
     const titolsNorm = (titolsSerie || []).map(normalitzaTitol).filter(Boolean);
     // La marca fa que el cau distingeixi la mateixa carpeta demanada per
@@ -2661,12 +2748,18 @@ async function buildSearchQuery(streamRequest) {
 // de stream diferents en obrir-la. Deduplica per ID d'IMDB quan n'hi ha, i
 // si no, pel títol netejat.
 function dedupMetas(metas) {
+    // NOMÉS fusionem per imdbId real (identitat confirmada). Abans es
+    // fusionava també per una aproximació del títol quan no hi havia
+    // imdbId, i això amagava contingut real i divers: extres/variants
+    // d'una mateixa peça ("Plastic Little Promotional Video" fonent-se amb
+    // "Plastic Little"), o sèries DIFERENTS d'una mateixa franquícia
+    // ("Bola de Drac Z"/"GT"/"Kai" fonent-se amb "Bola de Drac" perquè
+    // comparteixen les primeres paraules del nom). Sense imdbId, cada
+    // carpeta/fitxer és la seva pròpia entrada.
     const vistos = new Map();
     for (const meta of metas) {
         if (!meta) continue;
-        const clau = meta.id.startsWith("tt")
-            ? meta.id
-            : "nom:" + (cleanTitleForSearch(meta.name).queries[0] || meta.name).toLowerCase();
+        const clau = meta.id;
         const previ = vistos.get(clau);
         if (!previ) {
             vistos.set(clau, meta);
@@ -2826,22 +2919,22 @@ async function handleRequest(request) {
 
             // ── Sèries ────────────────────────────────────────────────────
             for (const rootId of CONFIG.collectionsRootFolderIds) {
-                let carpetes = [];
-                try { carpetes = await listChildren(rootId, accessToken, { onlyFolders: true }); }
+                let entrades = [];
+                try { entrades = await obtenirEntradesDeColleccio(rootId, accessToken); }
                 catch (e) { continue; }
-                totalSeries += carpetes.length;
-                for (const folder of carpetes) {
-                    const previ = llegeixMapa("s:" + folder.id);
+                totalSeries += entrades.length;
+                for (const entrada of entrades) {
+                    const previ = llegeixMapa(entrada.clau);
                     // Un intent fallit NO és definitiu: la lògica de
                     // reconeixement va millorant, així que els reintentem
                     // unes quantes vegades abans de donar-los per perduts.
                     if (previ && !calReintentar(previ)) continue;
                     if (!quedaPressupost(8)) { pendents++; continue; }
-                    const r = await getTmdbPosterByName(folder.name, { preferTv: true });
-                    escriuMapa("s:" + folder.id, r?.imdbId
-                        ? { imdbId: r.imdbId, poster: r.poster, background: r.background, title: r.title, overview: r.overview || null }
+                    const r = await getTmdbPosterByName(entrada.nom, { preferTv: true });
+                    escriuMapa(entrada.clau, r?.imdbId
+                        ? { imdbId: r.imdbId, poster: r.poster, background: r.background, title: r.title, overview: r.overview || null, ids: entrada.ids }
                         : { imdbId: null, poster: r?.poster || null, background: r?.background || null,
-                            title: r?.title || null, overview: null, intents: (previ?.intents || 0) + 1 });
+                            title: r?.title || null, overview: null, ids: entrada.ids, intents: (previ?.intents || 0) + 1 });
                     resoltes++;
                 }
             }
@@ -3099,7 +3192,12 @@ ${acabat
             }
 
             if (fullMetaId.startsWith("gdriveshow:")) {
-                const folderId = fullMetaId.split(":")[1];
+                // Pot dur més d'un id de carpeta separats per "+" quan
+                // detectaFranquicia() ha agrupat diverses subcarpetes com a
+                // variants de la mateixa sèrie (ex. "Bola de Drac [Bluray]"
+                // i "Bola de Drac [cat jap]" són totes dues la sèrie
+                // original, no dues sèries diferents).
+                const folderIds = fullMetaId.split(":")[1].split("+").filter(Boolean);
                 const accessToken = await getAccessToken();
                 if (!accessToken) {
                     console.error({
@@ -3108,14 +3206,16 @@ ${acabat
                     });
                     return createJsonResponse({ meta: null }, 502);
                 }
-                console.log({ message: "Collection meta request", folderId });
+                console.log({ message: "Collection meta request", folderIds });
                 let folderInfo;
                 let fitxersRuta;
                 try {
-                    [folderInfo, fitxersRuta] = await Promise.all([
-                        fetchFile(folderId, accessToken),
-                        walkCollectionFiles(folderId, accessToken),
+                    const resultats = await Promise.all([
+                        fetchFile(folderIds[0], accessToken),
+                        ...folderIds.map((id) => walkCollectionFiles(id, accessToken)),
                     ]);
+                    folderInfo = resultats[0];
+                    fitxersRuta = resultats.slice(1).flat();
                 } catch (error) {
                     console.error({
                         message: "Failed to walk collection folder",
@@ -3123,6 +3223,9 @@ ${acabat
                     });
                     return createJsonResponse({ meta: null }, 500);
                 }
+                // Un mateix episodi pot aparèixer a més d'una de les
+                // carpetes agrupades (rips diferents): ens quedem amb tots,
+                // assignaEpisodis ja els ordena i numera junts.
                 const episodis = assignaEpisodis(fitxersRuta);
                 const videos = episodis.map((ep) => ({
                     id: `gdrive:${ep.file.id}`,
@@ -3134,15 +3237,15 @@ ${acabat
                 }));
                 console.log({
                     message: "Collection meta built",
-                    folderId,
+                    folderIds,
                     numVideos: videos.length,
                 });
                 // El catàleg (gdrive_collections) ja resol pòster/sinopsi via
-                // TMDB i ho desa a "s:<folderId>" — abans aquesta pantalla de
-                // detall no ho reaprofitava i sempre sortia sense pòster ni
-                // descripció, encara que la graella sí que en tingués.
+                // TMDB i ho desa a la mateixa clau — abans aquesta pantalla
+                // de detall no ho reaprofitava i sempre sortia sense pòster
+                // ni descripció, encara que la graella sí que en tingués.
                 const nomBase = folderInfo?.name || "Col·lecció";
-                const dades = llegeixMapa("s:" + folderId);
+                const dades = llegeixMapa("s:" + folderIds.join("+"));
                 return createJsonResponse({
                     meta: {
                         id: fullMetaId,
@@ -3205,12 +3308,13 @@ ${acabat
                 }
                 await carregaMapa();
 
-                // 1r pas: llistar carpetes (poques subpeticions)
-                const carpetes = [];
+                // 1r pas: llistar entrades (una per subcarpeta, o una per
+                // cada sèrie diferent quan la subcarpeta és en realitat un
+                // contenidor de franquícia amb diverses sèries a dins).
+                const entrades = [];
                 for (const rootId of CONFIG.collectionsRootFolderIds) {
                     try {
-                        const subfolders = await listChildren(rootId, accessToken, { onlyFolders: true });
-                        carpetes.push(...subfolders);
+                        entrades.push(...(await obtenirEntradesDeColleccio(rootId, accessToken)));
                     } catch (error) {
                         console.error({ message: "No s'han pogut llistar les col·leccions", error: error.toString() });
                     }
@@ -3219,27 +3323,27 @@ ${acabat
                 // 2n pas: separar les que ja tenim resoltes de les pendents
                 const jaResoltes = [];
                 const pendents = [];
-                for (const folder of carpetes) {
-                    const cau = llegeixMapa("s:" + folder.id);
-                    if (cau) jaResoltes.push({ folder, dades: cau });
-                    else pendents.push(folder);
+                for (const entrada of entrades) {
+                    const cau = llegeixMapa(entrada.clau);
+                    if (cau) jaResoltes.push({ entrada, dades: cau });
+                    else pendents.push(entrada);
                 }
 
                 // 3r pas: resoldre només un grapat de pendents per petició,
                 // mentre quedi pressupost de subpeticions
                 let resoltesAra = 0;
-                for (const folder of pendents) {
+                for (const entrada of pendents) {
                     if (resoltesAra >= CONFIG.maxResolucionsPerPeticio) break;
                     if (!quedaPressupost(6)) break;
-                    const tmdb = await getTmdbPosterByName(folder.name, { preferTv: true });
+                    const tmdb = await getTmdbPosterByName(entrada.nom, { preferTv: true });
                     const dades = tmdb
                         ? {
                             imdbId: tmdb.imdbId, poster: tmdb.poster, background: tmdb.background,
-                            title: tmdb.title, overview: tmdb.overview || null,
+                            title: tmdb.title, overview: tmdb.overview || null, ids: entrada.ids,
                         }
-                        : { imdbId: null, poster: null, background: null, title: null, overview: null };
-                    escriuMapa("s:" + folder.id, dades);
-                    jaResoltes.push({ folder, dades });
+                        : { imdbId: null, poster: null, background: null, title: null, overview: null, ids: entrada.ids };
+                    escriuMapa(entrada.clau, dades);
+                    jaResoltes.push({ entrada, dades });
                     resoltesAra++;
                 }
 
@@ -3247,45 +3351,45 @@ ${acabat
                 // resolt es mostren igualment (amb el nom de la carpeta),
                 // i es resoldran en els propers refrescs.
                 const metas = [];
-                const resoltesIds = new Set(jaResoltes.map((x) => x.folder.id));
-                for (const { folder, dades } of jaResoltes) {
+                const resoltesClaus = new Set(jaResoltes.map((x) => x.entrada.clau));
+                for (const { entrada, dades } of jaResoltes) {
                     if (dades.imdbId) {
-                        IMDB_TO_GDRIVE.set(dades.imdbId, { type: "series", ids: [folder.id] });
+                        IMDB_TO_GDRIVE.set(dades.imdbId, { type: "series", ids: dades.ids || entrada.ids });
                         metas.push({
                             id: dades.imdbId,
                             type: "series",
-                            name: ambEtiquetaCat(dades.title || folder.name),
+                            name: ambEtiquetaCat(dades.title || entrada.nom),
                             posterShape: "poster",
-                            poster: dades.poster || posterGenerat(dades.title || folder.name),
+                            poster: dades.poster || posterGenerat(dades.title || entrada.nom),
                             background: dades.background || null,
                         });
                     } else {
                         metas.push({
-                            id: `gdriveshow:${folder.id}`,
+                            id: `gdriveshow:${entrada.ids.join("+")}`,
                             type: "series",
-                            name: ambEtiquetaCat(folder.name),
+                            name: ambEtiquetaCat(entrada.nom),
                             posterShape: "poster",
-                            poster: dades.poster || posterGenerat(folder.name),
+                            poster: dades.poster || posterGenerat(entrada.nom),
                             background: dades.background || null,
                         });
                     }
                 }
-                for (const folder of carpetes) {
-                    if (resoltesIds.has(folder.id)) continue;
+                for (const entrada of entrades) {
+                    if (resoltesClaus.has(entrada.clau)) continue;
                     metas.push({
-                        id: `gdriveshow:${folder.id}`,
+                        id: `gdriveshow:${entrada.ids.join("+")}`,
                         type: "series",
-                        name: ambEtiquetaCat(folder.name),
+                        name: ambEtiquetaCat(entrada.nom),
                         posterShape: "poster",
-                        poster: posterGenerat(folder.name),
+                        poster: posterGenerat(entrada.nom),
                     });
                 }
 
                 const metasFinals = dedupMetas(metas);
                 console.log({
                     message: "Catàleg de col·leccions",
-                    carpetes: carpetes.length,
-                    jaAlMapa: carpetes.length - pendents.length,
+                    entrades: entrades.length,
+                    jaAlMapa: entrades.length - pendents.length,
                     resoltesAra,
                     pendents: pendents.length - resoltesAra,
                     metas: metasFinals.length,
