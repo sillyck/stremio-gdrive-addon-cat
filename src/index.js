@@ -205,13 +205,20 @@ function construeixIndexInvers() {
     for (const [clau, valor] of Object.entries(MAPA)) {
         if (!valor?.imdbId) continue;
         const tipus = clau.startsWith("s:") ? "series" : "movie";
-        const id = clau.slice(2);
+        // Una clau de sèrie pot dur diverses carpetes juntes ("s:idA+idB")
+        // quan detectaFranquicia() les ha agrupat com a la mateixa sèrie.
+        // Preferim el camp "ids" ja desat a la pròpia entrada (l'escriu
+        // /omplir i el catàleg en resoldre-la); si no hi és (entrades
+        // antigues, format d'un sol id), el traiem de la clau tal com abans.
+        const ids = Array.isArray(valor.ids) && valor.ids.length
+            ? valor.ids
+            : clau.slice(2).split("+").filter(Boolean);
         const existent = INDEX_INVERS.get(valor.imdbId);
         if (!existent) {
-            INDEX_INVERS.set(valor.imdbId, { tipus, ids: [id] });
+            INDEX_INVERS.set(valor.imdbId, { tipus, ids: [...ids] });
         } else if (existent.tipus === tipus) {
             // Diverses còpies del mateix títol (qualitats diferents)
-            existent.ids.push(id);
+            existent.ids.push(...ids);
         }
     }
     return INDEX_INVERS;
@@ -241,6 +248,22 @@ function escriuMapa(clau, valor) {
     MAPA[clau] = { ...valor, ts: Date.now() };
     MAPA_BRUT = true;
     INDEX_INVERS = null;   // s'ha de reconstruir
+}
+
+// TMDB pot no tenir fitxa pròpia per a una sèrie derivada d'una franquícia
+// (ex. cap fitxa catalana per a "Bola de Drac Kai", només per "Bola de Drac
+// Z Kai") i acabar assignant el MATEIX imdbId a dos clústers de carpetes
+// DIFERENTS. Sense aquesta comprovació, dedupMetas() els fondria en una
+// sola entrada i el contingut de l'altre desapareixeria del catàleg sense
+// cap avís. Si l'imdbId ja pertany a una altra clau de sèrie, no l'acceptem
+// per aquesta: es queda com a entrada pròpia sense resoldre, però visible.
+function imdbIdJaUsatPerUnaAltraClau(imdbId, claupropia) {
+    if (!imdbId || !MAPA) return false;
+    for (const [clau, v] of Object.entries(MAPA)) {
+        if (clau === claupropia) continue;
+        if (clau.startsWith("s:") && v?.imdbId === imdbId) return true;
+    }
+    return false;
 }
 
 // Limitar concurrència per no superar rate limits de TMDB (~40 req/10s)
@@ -2941,7 +2964,11 @@ async function handleRequest(request) {
                     if (previ && !calReintentar(previ)) continue;
                     if (!quedaPressupost(8)) { pendents++; continue; }
                     const r = await getTmdbPosterByName(entrada.nom, { preferTv: true });
-                    escriuMapa(entrada.clau, r?.imdbId
+                    const colisio = r?.imdbId && imdbIdJaUsatPerUnaAltraClau(r.imdbId, entrada.clau);
+                    if (colisio) {
+                        console.log({ message: "imdbId ja assignat a una altra sèrie: es queda sense resoldre", clau: entrada.clau, nom: entrada.nom, imdbId: r.imdbId });
+                    }
+                    escriuMapa(entrada.clau, (r?.imdbId && !colisio)
                         ? { imdbId: r.imdbId, poster: r.poster, background: r.background, title: r.title, overview: r.overview || null, ids: entrada.ids }
                         : { imdbId: null, poster: r?.poster || null, background: r?.background || null,
                             title: r?.title || null, overview: null, ids: entrada.ids, intents: (previ?.intents || 0) + 1 });
@@ -3346,12 +3373,14 @@ ${acabat
                     if (resoltesAra >= CONFIG.maxResolucionsPerPeticio) break;
                     if (!quedaPressupost(6)) break;
                     const tmdb = await getTmdbPosterByName(entrada.nom, { preferTv: true });
-                    const dades = tmdb
+                    const colisio = tmdb?.imdbId && imdbIdJaUsatPerUnaAltraClau(tmdb.imdbId, entrada.clau);
+                    const dades = (tmdb && !colisio)
                         ? {
                             imdbId: tmdb.imdbId, poster: tmdb.poster, background: tmdb.background,
                             title: tmdb.title, overview: tmdb.overview || null, ids: entrada.ids,
                         }
-                        : { imdbId: null, poster: null, background: null, title: null, overview: null, ids: entrada.ids };
+                        : { imdbId: null, poster: tmdb?.poster || null, background: tmdb?.background || null,
+                            title: null, overview: null, ids: entrada.ids };
                     escriuMapa(entrada.clau, dades);
                     jaResoltes.push({ entrada, dades });
                     resoltesAra++;
