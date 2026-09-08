@@ -2196,6 +2196,16 @@ async function obtenirEntradesDeColleccio(rootId, accessToken) {
     }
     const entrades = [];
     for (const folder of carpetes) {
+        // Si la carpeta JA té una entrada senzilla resolta (format antic,
+        // "s:<id>"), no gastem cap subpetició comprovant si és un
+        // contenidor de franquícia — es manté tal com estava. Només mirem
+        // les que encara no s'han resolt mai (o que s'han esborrat expressament
+        // amb /esborra perquè es reavaluïn amb la lògica nova).
+        const previ = llegeixMapa("s:" + folder.id);
+        if (previ && !calReintentar(previ)) {
+            entrades.push({ ids: [folder.id], nom: folder.name, clau: "s:" + folder.id });
+            continue;
+        }
         const franquicia = await detectaFranquicia(folder.id, accessToken);
         if (franquicia) {
             for (const f of franquicia) {
