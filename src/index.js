@@ -148,6 +148,25 @@ function ambEtiquetaCat(nom) {
     return / \[CAT\]$/.test(nom) ? nom : `${nom} [CAT]`;
 }
 
+// Avís per Telegram quan el reompliment programat troba títols nous.
+// Reaprofita el mateix bot que ja fas servir a Telegram-Stremio — calen
+// TELEGRAM_BOT_TOKEN i TELEGRAM_CHAT_ID com a secrets del Worker. Si no
+// estan configurats, no fa res (no és cap dependència, és opcional).
+async function notificaTelegram(text) {
+    const token = globalThis.__env?.TELEGRAM_BOT_TOKEN;
+    const chatId = globalThis.__env?.TELEGRAM_CHAT_ID;
+    if (!token || !chatId) return;
+    try {
+        await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" }),
+        });
+    } catch (e) {
+        console.error({ message: "No s'ha pogut notificar per Telegram", error: e.toString() });
+    }
+}
+
 // ── Mapa persistent carpeta/fitxer → metadades ────────────────────────────
 // Preferim el KV natiu de Workers (globalThis.__env.MAPA_KV, vinculat des
 // de wrangler.toml) quan hi és — és un magatzem fet expressament per a
@@ -310,6 +329,111 @@ const HEADERS = {
     "Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
     "Access-Control-Max-Age": "86400",
 };
+
+// Pàgina d'administració (/admin): llista les entrades sense resoldre i
+// permet buscar-les a TMDB i assignar-les a mà amb un clic, en lloc
+// d'haver-ho de fer amb curl/JSON. Vanilla JS, sense dependències externes
+// (Cloudflare Workers no serveix res estàtic per si sol).
+const PAGINA_ADMIN = `<!DOCTYPE html>
+<html lang="ca">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin — stremio-gdrive-addon-cat</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; background: #111; color: #eee; }
+  h1 { font-size: 1.3rem; }
+  .pendent { border: 1px solid #333; border-radius: 8px; padding: .75rem; margin-bottom: .75rem; display: flex; gap: .75rem; align-items: flex-start; }
+  .pendent img { width: 46px; border-radius: 4px; flex-shrink: 0; background: #222; }
+  .pendent .info { flex: 1; min-width: 0; }
+  .pendent .nom { font-weight: 600; margin-bottom: .4rem; }
+  .cerca-row { display: flex; gap: .4rem; margin-bottom: .4rem; }
+  input[type=text] { flex: 1; padding: .35rem; border-radius: 4px; border: 1px solid #444; background: #1a1a1a; color: #eee; }
+  button { padding: .35rem .7rem; border-radius: 4px; border: 1px solid #555; background: #222; color: #eee; cursor: pointer; }
+  button:hover { background: #333; }
+  .resultats { display: flex; flex-direction: column; gap: .3rem; margin-top: .4rem; }
+  .resultat { display: flex; gap: .5rem; align-items: center; border: 1px solid #2a2a2a; border-radius: 6px; padding: .3rem .5rem; }
+  .resultat img { width: 32px; border-radius: 3px; }
+  .resultat span { flex: 1; font-size: .85rem; }
+  .resultat button { font-size: .8rem; }
+  #estat { color: #999; font-size: .9rem; margin-bottom: 1rem; }
+  .buit { color: #6a6; padding: 2rem; text-align: center; }
+</style>
+</head>
+<body>
+<h1>Entrades sense resoldre</h1>
+<div id="estat">Carregant…</div>
+<div id="llista"></div>
+
+<script>
+async function carrega() {
+  const r = await fetch('/admin/dades');
+  const d = await r.json();
+  document.getElementById('estat').textContent = d.total + ' entrada(es) pendent(s) de resoldre.';
+  const cont = document.getElementById('llista');
+  cont.innerHTML = '';
+  if (d.total === 0) {
+    cont.innerHTML = '<div class="buit">Tot resolt 🎉</div>';
+    return;
+  }
+  for (const p of d.pendents) {
+    const div = document.createElement('div');
+    div.className = 'pendent';
+    div.innerHTML =
+      '<img src="' + (p.poster || '') + '" onerror="this.style.visibility=\\'hidden\\'">' +
+      '<div class="info">' +
+        '<div class="nom">' + p.nom + ' <small style="color:#888">(' + p.tipus + ')</small></div>' +
+        '<div class="cerca-row">' +
+          '<input type="text" value="' + p.nom.replace(/"/g,'') + '" placeholder="cerca a TMDB...">' +
+          '<button data-accio="cerca">Cerca</button>' +
+          '<button data-accio="esborra" style="background:#3a1a1a">Descarta</button>' +
+        '</div>' +
+        '<div class="resultats"></div>' +
+      '</div>';
+    const input = div.querySelector('input');
+    const resultatsDiv = div.querySelector('.resultats');
+    div.querySelector('[data-accio="cerca"]').onclick = () => cercaTmdb(p, input.value, resultatsDiv);
+    div.querySelector('[data-accio="esborra"]').onclick = async () => {
+      await fetch('/esborra?clau=' + encodeURIComponent(p.clau));
+      div.remove();
+    };
+    cont.appendChild(div);
+  }
+}
+
+async function cercaTmdb(p, query, resultatsDiv) {
+  resultatsDiv.textContent = 'Cercant...';
+  const r = await fetch('/admin/cerca?q=' + encodeURIComponent(query) + '&tipus=' + (p.tipus === 'movie' ? 'movie' : 'tv'));
+  const d = await r.json();
+  resultatsDiv.innerHTML = '';
+  if (!d.resultats || d.resultats.length === 0) {
+    resultatsDiv.textContent = 'Sense resultats.';
+    return;
+  }
+  for (const res of d.resultats) {
+    const row = document.createElement('div');
+    row.className = 'resultat';
+    row.innerHTML =
+      '<img src="' + (res.poster || '') + '" onerror="this.style.visibility=\\'hidden\\'">' +
+      '<span>' + res.nom + (res.any ? ' (' + res.any + ')' : '') + '</span>' +
+      '<button>Tria aquest</button>';
+    row.querySelector('button').onclick = async () => {
+      row.querySelector('button').textContent = 'Desant...';
+      await fetch('/admin/assigna', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clau: p.clau, tmdbId: res.tmdbId, tipus: p.tipus }),
+      });
+      row.closest('.pendent').remove();
+    };
+    resultatsDiv.appendChild(row);
+  }
+}
+
+carrega();
+</script>
+</body>
+</html>`;
 
 const API_ENDPOINTS = {
     DRIVE_FETCH_FILES: "https://content.googleapis.com/drive/v3/files",
@@ -3176,6 +3300,93 @@ ${acabat
             return createJsonResponse({ clau, esborrada: hiEra });
         }
 
+        // ── Pàgina d'administració ───────────────────────────────────────
+        // Llista les entrades sense resoldre perquè es puguin corregir a mà
+        // (buscar a TMDB i triar la correcta) en lloc d'haver de fer-ho amb
+        // curl/JSON com fins ara.
+        if (url.pathname === "/admin") {
+            return new Response(PAGINA_ADMIN, {
+                headers: { "Content-Type": "text/html; charset=utf-8" },
+            });
+        }
+
+        if (url.pathname === "/admin/dades") {
+            const mapa = await carregaMapa();
+            const pendents = Object.entries(mapa || {})
+                .filter(([clau, v]) => !clau.startsWith("__") && !v?.imdbId)
+                .map(([clau, v]) => ({
+                    clau,
+                    nom: v?.title || v?.nom || clau.slice(2).split("+")[0],
+                    tipus: clau.startsWith("s:") ? "series" : "movie",
+                    poster: v?.poster || null,
+                }))
+                .sort((a, b) => a.nom.localeCompare(b.nom));
+            return createJsonResponse({ total: pendents.length, pendents });
+        }
+
+        if (url.pathname === "/admin/cerca") {
+            const q = url.searchParams.get("q");
+            const tipus = url.searchParams.get("tipus") === "movie" ? "movie" : "tv";
+            if (!q) return createJsonResponse({ error: "Falta ?q=" }, 400);
+            if (!CONFIG.tmdbApiKey) return createJsonResponse({ error: "Sense TMDB_API_KEY" }, 500);
+            try {
+                const params = new URLSearchParams({
+                    api_key: CONFIG.tmdbApiKey, query: q, page: "1",
+                    include_adult: "false", language: "ca-ES",
+                });
+                const res = await fetch(`https://api.themoviedb.org/3/search/${tipus}?${params}`);
+                const data = await res.json();
+                const resultats = (data.results || []).slice(0, 15).map((r) => ({
+                    tmdbId: r.id,
+                    nom: r.name || r.title,
+                    nomOriginal: r.original_name || r.original_title,
+                    any: (r.first_air_date || r.release_date || "").slice(0, 4),
+                    poster: r.poster_path ? `https://image.tmdb.org/t/p/w200${r.poster_path}` : null,
+                    overview: r.overview || "",
+                }));
+                return createJsonResponse({ resultats });
+            } catch (e) {
+                return createJsonResponse({ error: e.toString() }, 500);
+            }
+        }
+
+        if (url.pathname === "/admin/assigna" && request.method === "POST") {
+            let body;
+            try { body = await request.json(); } catch (e) {
+                return createJsonResponse({ error: "JSON invàlid" }, 400);
+            }
+            const { clau, tmdbId, tipus } = body || {};
+            if (!clau || !tmdbId || !tipus) {
+                return createJsonResponse({ error: "Calen clau, tmdbId i tipus" }, 400);
+            }
+            if (!CONFIG.tmdbApiKey) return createJsonResponse({ error: "Sense TMDB_API_KEY" }, 500);
+            try {
+                const mediaType = tipus === "movie" ? "movie" : "tv";
+                const detallUrl = `https://api.themoviedb.org/3/${mediaType}/${tmdbId}?api_key=${CONFIG.tmdbApiKey}&language=ca-ES`;
+                const extUrl = API_ENDPOINTS.TMDB_EXTERNAL_IDS
+                    .replace("{type}", mediaType).replace("{id}", tmdbId).replace("{apiKey}", CONFIG.tmdbApiKey);
+                const [detallRes, extRes] = await Promise.all([fetch(detallUrl), fetch(extUrl)]);
+                const detall = await detallRes.json();
+                const ext = extRes.ok ? await extRes.json() : {};
+                await carregaMapa();
+                const previ = llegeixMapa(clau);
+                const ids = previ?.ids || [clau.slice(2)].flatMap((s) => s.split("+"));
+                escriuMapa(clau, {
+                    imdbId: ext.imdb_id || null,
+                    poster: detall.poster_path ? `https://image.tmdb.org/t/p/w500${detall.poster_path}` : null,
+                    background: detall.backdrop_path ? `https://image.tmdb.org/t/p/w1280${detall.backdrop_path}` : null,
+                    title: detall.name || detall.title || null,
+                    overview: detall.overview || null,
+                    ids,
+                    assignatAMa: true,
+                });
+                await desaMapa(globalThis.__ctx);
+                return createJsonResponse({ ok: true, imdbId: ext.imdb_id || null, title: detall.name || detall.title });
+            } catch (e) {
+                return createJsonResponse({ error: e.toString() }, 500);
+            }
+        }
+
         const streamMatch = REGEX_PATTERNS.validStreamRequest.exec(
             url.pathname
         );
@@ -4337,6 +4548,11 @@ export default {
         globalThis.__ctx = ctx;
         globalThis.__env = env;
 
+        // Instantània d'abans, per saber què és NOU un cop acabades les
+        // passades (i poder-ho notificar per Telegram si està configurat).
+        await carregaMapa();
+        const clausAbans = new Set(Object.keys(MAPA || {}));
+
         const PASSADES = 8;
         for (let i = 0; i < PASSADES; i++) {
             reiniciaPressupost(46);
@@ -4346,6 +4562,21 @@ export default {
                 console.error({ message: "Error en /omplir programat", passada: i, error: e.toString() });
             }
         }
-        console.log({ message: "Reompliment programat completat", passades: PASSADES, cron: event.cron });
+
+        const titolsNous = [];
+        for (const [clau, valor] of Object.entries(MAPA || {})) {
+            if (!clausAbans.has(clau) && valor?.title) titolsNous.push(valor.title);
+        }
+        console.log({
+            message: "Reompliment programat completat",
+            passades: PASSADES, cron: event.cron, titolsNous: titolsNous.length,
+        });
+        if (titolsNous.length > 0) {
+            const llista = titolsNous.slice(0, 20).map((t) => `• ${t}`).join("\n");
+            const extra = titolsNous.length > 20 ? `\n… i ${titolsNous.length - 20} més` : "";
+            await notificaTelegram(
+                `🎬 <b>${titolsNous.length} títol(s) nou(s) al catàleg</b>\n\n${llista}${extra}`
+            );
+        }
     },
 };
