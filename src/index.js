@@ -139,6 +139,15 @@ function numeroOUndefined(valor) {
     return Number.isNaN(n) ? undefined : n;
 }
 
+// Marca visualment que el contingut és la unitat compartida en català,
+// perquè un usuari qualsevol ho vegi d'un cop d'ull al catàleg de Stremio
+// (el títol de TMDB per si sol no ho diu — "One Piece" podria ser qualsevol
+// idioma). No es toca si ja hi és (evita duplicar-la en un refresc de mapa).
+function ambEtiquetaCat(nom) {
+    if (!nom) return nom;
+    return / \[CAT\]$/.test(nom) ? nom : `${nom} [CAT]`;
+}
+
 // ── Mapa persistent carpeta/fitxer → metadades ────────────────────────────
 // Tot el mapa es desa en UN sol objecte a la Cache API: llegir-lo costa una
 // única subpetició en comptes d'una per títol, que és el que feia inviable
@@ -1439,7 +1448,17 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
             const results = data.results || [];
 
             let m = null;
-            for (const r of results.slice(0, 8)) {
+            // ABANS: només es miraven els primers 8 resultats. TMDB ja els
+            // ha tornat TOTS en aquesta mateixa resposta (cap subpetició
+            // extra en mirar-ne més), i quan hi ha molt de "soroll" amb el
+            // mateix nom (remakes, versions real-life-action, coincidències
+            // en anglès) el títol real d'anime queda més avall i mai
+            // s'arribava a mirar. Casos reals confirmats: "One Piece" (la
+            // sèrie real-life-action de Netflix ocupa la posició 0, l'anime
+            // real la 8), "Remi" (el títol real en català, "Remi, el noi
+            // sense llar", queda a la posició 16 entre resultats sense
+            // relació com "Remington Steele" o "Remix").
+            for (const r of results.slice(0, 20)) {
                 const mt = r.media_type || (endpoint === "tv" ? "tv" : "movie");
                 if (preferTv && mt === "movie") continue;
 
@@ -2966,6 +2985,28 @@ ${acabat
             return createJsonResponse({ missatge: "Mapa esborrat." });
         }
 
+        // Esborra UNA entrada concreta del mapa (ex. ?clau=s:1abc... per una
+        // sèrie, ?clau=m:1xyz... per una pel·lícula), en lloc de buidar-ho
+        // tot. Útil quan un títol s'ha resolt malament (ex. un match amb la
+        // versió real-life-action en lloc de l'anime): la propera passada
+        // d'/omplir el torna a intentar amb la lògica ja corregida, sense
+        // haver de re-resoldre les altres centenars d'entrades ja bones.
+        if (url.pathname === "/esborra") {
+            const clau = url.searchParams.get("clau");
+            if (!clau) {
+                return createJsonResponse({ error: "Falta el paràmetre ?clau=s:<id> o ?clau=m:<id>" }, 400);
+            }
+            await carregaMapa();
+            const hiEra = !!llegeixMapa(clau);
+            if (hiEra) {
+                delete MAPA[clau];
+                MAPA_BRUT = true;
+                INDEX_INVERS = null;
+                await desaMapa(globalThis.__ctx);
+            }
+            return createJsonResponse({ clau, esborrada: hiEra });
+        }
+
         const streamMatch = REGEX_PATTERNS.validStreamRequest.exec(
             url.pathname
         );
@@ -3025,7 +3066,7 @@ ${acabat
                     : "");
             return {
                 id: dades?.imdbId ? dades.imdbId : `gdrive:${id}`,
-                name: dades?.title || name,
+                name: ambEtiquetaCat(dades?.title || name),
                 type: "movie",
                 posterShape: "poster",
                 poster: dades?.poster || posterGenerat(dades?.title || name),
@@ -3097,7 +3138,7 @@ ${acabat
                     meta: {
                         id: fullMetaId,
                         type: "series",
-                        name: dades?.title || nomBase,
+                        name: ambEtiquetaCat(dades?.title || nomBase),
                         posterShape: "poster",
                         poster: dades?.poster || posterGenerat(dades?.title || nomBase),
                         background: dades?.background || null,
@@ -3204,7 +3245,7 @@ ${acabat
                         metas.push({
                             id: dades.imdbId,
                             type: "series",
-                            name: dades.title || folder.name,
+                            name: ambEtiquetaCat(dades.title || folder.name),
                             posterShape: "poster",
                             poster: dades.poster || posterGenerat(dades.title || folder.name),
                             background: dades.background || null,
@@ -3213,7 +3254,7 @@ ${acabat
                         metas.push({
                             id: `gdriveshow:${folder.id}`,
                             type: "series",
-                            name: folder.name,
+                            name: ambEtiquetaCat(folder.name),
                             posterShape: "poster",
                             poster: dades.poster || posterGenerat(folder.name),
                             background: dades.background || null,
@@ -3225,7 +3266,7 @@ ${acabat
                     metas.push({
                         id: `gdriveshow:${folder.id}`,
                         type: "series",
-                        name: folder.name,
+                        name: ambEtiquetaCat(folder.name),
                         posterShape: "poster",
                         poster: posterGenerat(folder.name),
                     });
@@ -3305,7 +3346,7 @@ ${acabat
                     if (v.imdbId) IMDB_TO_GDRIVE.set(v.imdbId, { type: "movie", id: fileId });
                     totsMetas.push({
                         id: v.imdbId || `gdrive:${fileId}`,
-                        name: v.title || v.nom || "?",
+                        name: ambEtiquetaCat(v.title || v.nom || "?"),
                         type: "movie",
                         posterShape: "poster",
                         poster: v.poster || posterGenerat(v.title || v.nom),
