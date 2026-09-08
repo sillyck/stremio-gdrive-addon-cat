@@ -32,7 +32,14 @@ const CONFIG = {
     tmdbApiKey: null,
     enableSearchCatalog: true,
     enableVideoCatalog: true,
-    maxFilesToFetch: 1000,
+    // Sostre de seguretat, NO un límit pràctic: abans era 1000 i tallava en
+    // sec el catàleg de pel·lícules (ordenat per data de creació) just
+    // després dels 1000 fitxers més recents, deixant fora tota la resta —
+    // amb els milers de fitxers reals de "Pelis" (varis rips per pel·lícula),
+    // la immensa majoria mai arribava a Stremio. La paginació real ara para
+    // sola quan s'acaba el pressupost de subpeticions (vegeu fetchFiles),
+    // no per aquest número.
+    maxFilesToFetch: 200000,
 
     // ── Límits del pla gratuït de Cloudflare Workers ──────────────────────
     // Free: 50 subpeticions externes per invocació (les crides a la Cache API
@@ -1901,6 +1908,16 @@ async function fetchFiles(fetchUrl, accessToken) {
             numItems: results.files.length,
         });
         while (results.nextPageToken) {
+            // Cada pàgina és una subpetició real: abans no es comptava
+            // (només la primera es descomptava del pressupost), així que amb
+            // una carpeta gran es podia superar el límit real de Cloudflare
+            // sense que el nostre propi comptador se n'assabentés. Parem
+            // ABANS de demanar-la si no queda marge — millor un catàleg
+            // parcial però consistent que un error 1015/subrequest.
+            if (!consumeix(1)) {
+                console.log({ message: "Sense pressupost per seguir paginant", files: results.files.length });
+                break;
+            }
             fetchUrl.searchParams.set("pageToken", results.nextPageToken);
             const nextPageResponse = await fetch(fetchUrl.toString(), {
                 headers: { Authorization: `Bearer ${accessToken}` },
@@ -3757,6 +3774,9 @@ ${acabat
                 }
 
                 const metasFinals = dedupMetas(metas);
+                metasFinals.sort((a, b) =>
+                    (a.name || "").localeCompare(b.name || "", "ca", { sensitivity: "base", numeric: true })
+                );
                 console.log({
                     message: "Catàleg de col·leccions",
                     entrades: entrades.length,
@@ -3790,7 +3810,14 @@ ${acabat
                     includeItemsFromAllDrives: "true",
                     supportsAllDrives: "true",
                     pageSize: "1000",
-                    orderBy: "createdTime desc",
+                    // Abans "createdTime desc": si la paginació s'havia
+                    // d'aturar per pressupost, es perdien pel·lícules velles
+                    // escampades arreu de la llista. Amb ordre alfabètic, si
+                    // mai s'ha de parar, es para sempre pel mateix tram final
+                    // de l'alfabet — previsible i, com que el catàleg final
+                    // es torna a ordenar igual (vegeu més avall), no canvia
+                    // res quan sí que hi ha pressupost per acabar-la sencera.
+                    orderBy: "name_natural",
                     fields: "nextPageToken,incompleteSearch,files(id,name,size,videoMediaMetadata,mimeType,fileExtension,thumbnailLink,createdTime)",
                 };
 
@@ -3843,6 +3870,14 @@ ${acabat
                 }
 
                 const metas = dedupMetas(totsMetas);
+                // Ordre alfabètic del nom mostrat (no del nom de fitxer cru):
+                // un cop resolt, el nom pot venir de TMDB i diferir força del
+                // fitxer, així que l'ordenació s'ha de fer sobre el resultat
+                // final, no confiar en l'ordre amb què Drive ha donat els
+                // fitxers.
+                metas.sort((a, b) =>
+                    (a.name || "").localeCompare(b.name || "", "ca", { sensitivity: "base", numeric: true })
+                );
                 console.log({
                     message: "Catàleg de pel·lícules",
                     deColeccions,
