@@ -23,6 +23,15 @@ const CARPETES = {
     { id: "b1", name: "Inazuma Eleven - 001 - Comenca.mkv", mimeType: "video/x-matroska", size: "2000" },
     { id: "b2", name: "Inazuma Eleven - 002 - Segon.mkv", mimeType: "video/x-matroska", size: "2000" },
   ],
+  // Una ALTRA sèrie de la franquícia, associada per error al mateix IMDb ID
+  F_C: [
+    { id: "c1", name: "Inazuma Eleven Go - 001.mkv", mimeType: "video/x-matroska", size: "3000" },
+  ],
+  // Carpeta de la qual no es pot llegir el nom (afinitat 1): no es pot
+  // confirmar que sigui aquesta sèrie
+  F_D: [
+    { id: "d1", name: "Inazuma Eleven - 001 - Altra.mkv", mimeType: "video/x-matroska", size: "4000" },
+  ],
 };
 
 // Noms REALS de les carpetes (abans no es simulaven: qualsevol GET directe
@@ -33,6 +42,7 @@ const CARPETES = {
 const NOMS_CARPETA = {
   F_A: "Inazuma Eleven T1xC",
   F_B: "Inazuma Eleven (2008)",
+  F_C: "Inazuma Eleven Go",
 };
 
 let logs = [];
@@ -83,13 +93,17 @@ const prova = (d, c) => { total++; if (!c) fall++; console.log(`   ${c ? "✔" :
   console.log("UNA SÈRIE AMB DUES CARPETES DE CONVENCIONS DIFERENTS");
   console.log("═".repeat(72));
 
-  async function demana(s, e) {
+  async function demana(s, e, { ambGermana = false, ambSenseNom = false } = {}) {
     ctx.__t.reiniciaPressupost(46);
     ctx.__t.IMDB_TO_GDRIVE.clear();
     logs = [];
     ctx.__t.TITLES_CACHE.set("tt_IE", ["Inazuma Eleven"]);
     ctx.__t.SEASON_STRUCTURE_CACHE.set("tt_IE", null);
-    ctx.__t.setMapa({ "s:F_A": { imdbId: "tt_IE" }, "s:F_B": { imdbId: "tt_IE" } });
+    ctx.__t.setMapa({
+      "s:F_A": { imdbId: "tt_IE" }, "s:F_B": { imdbId: "tt_IE" },
+      ...(ambGermana ? { "s:F_C": { imdbId: "tt_IE" } } : {}),
+      ...(ambSenseNom ? { "s:F_D": { imdbId: "tt_IE" } } : {}),
+    });
     const r = await ctx.__t.getStreams({
       type: "series", id: `tt_IE:${s}:${e}`, season: s, episode: e,
       metadata: { name: "Inazuma Eleven" },
@@ -110,6 +124,16 @@ const prova = (d, c) => { total++; if (!c) fall++; console.log(`   ${c ? "✔" :
 
   const d = await demana(1, 500);
   prova("episodi inexistent → cap resultat", d.streams.length === 0);
+
+  const g = await demana(1, 1, { ambGermana: true });
+  const idsG = g.streams.map((st) => st.url || st.externalUrl || JSON.stringify(st));
+  prova("una sèrie germana (Inazuma Eleven Go) associada per error no hi cola episodis",
+        g.streams.length === 2 && !idsG.some((u) => u.includes("c1")));
+
+  const h = await demana(1, 1, { ambSenseNom: true });
+  const idsH = h.streams.map((st) => st.url || st.externalUrl || JSON.stringify(st));
+  prova("una carpeta de nom il·legible no s'hi afegeix quan ja hi ha resultats confirmats",
+        h.streams.length === 2 && !idsH.some((u) => u.includes("d1")));
 
   console.log("\n" + "═".repeat(72));
   console.log(fall === 0 ? `LES ${total} PROVES PASSEN` : `${fall} de ${total} FALLEN`);

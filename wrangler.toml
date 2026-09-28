@@ -7,11 +7,17 @@ compatibility_flags = [ "nodejs_compat" ]
 [observability.logs]
 enabled = true
 
-# Cron Trigger: crida scheduled() cada dia. Cloudflare sempre interpreta
-# l'horari en UTC (no admet zones horàries) — "0 3 * * *" són les 04:00 a
-# Madrid a l'hivern (CET, UTC+1) i les 05:00 a l'estiu (CEST, UTC+2). No hi
-# ha manera de fer-ho exacte a les 4h tot l'any sense dos crons + lògica
-# per triar quin toca segons l'època, cosa que no calia per una tasca de
-# manteniment com aquesta.
+# Mapa persistent de caràtules (títol → TMDB/IMDb). Sense aquest vincle el
+# worker cau a la Cache API, que és per centre de dades i volàtil: el cron
+# escrivia en un centre, les peticions d'Espanya en llegien un altre, i el
+# mapa es quedava en una dotzena d'entrades.
+# Sense "id": wrangler (>= 3.91) el crea sol al primer "wrangler deploy" i
+# el reutilitza als següents.
+[[kv_namespaces]]
+binding = "MAPA_KV"
+
+# Cron Trigger: una passada d'/omplir cada 10 minuts. Cada invocació té 50
+# subpeticions al pla gratuït (~7 títols); 144 passades al dia omplen el
+# catàleg en poques hores i després només hi ha feina quan afegeixes títols.
 [triggers]
-crons = ["0 3 * * *"]
+crons = ["*/10 * * * *"]

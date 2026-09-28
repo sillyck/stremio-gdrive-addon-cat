@@ -100,7 +100,7 @@ const CONFIG = {
 
 // Identificador de la versió del codi. Serveix per verificar via /versio
 // quina versió s'està executant realment al worker.
-const VERSIO_CODI = "2026-09-08.fixos-pelis-nulls-temporada0-mapa";
+const VERSIO_CODI = "2026-09-28.kv-cron-pendents-admin";
 
 const MANIFEST = {
     id: "stremio.gdrive.worker.cat",
@@ -185,9 +185,22 @@ const MAPA_URL = "https://gdrive-addon.local/__mapa_v1";
 const MAPA_KV_KEY = "mapa_v1";
 let MAPA = null;          // { [clau]: { imdbId, poster, background, title, ts } }
 let MAPA_BRUT = false;    // hi ha canvis pendents de desar?
+let MAPA_CARREGAT_TS = 0; // quan s'ha llegit per últim cop del persistent
+let MAPA_NO_FIABLE = false; // la lectura ha fallat: no es pot desar
+const MAPA_FRESC_MS = 60 * 1000;
 
 function kvMapa() {
     return globalThis.__env?.MAPA_KV || null;
+}
+
+// Quants títols pot resoldre EN LÍNIA una petició de catàleg. Amb KV el mapa
+// és global i persistent, i el cron (cada 10 min) l'omple: el catàleg només
+// l'ha de llegir. Resoldre-hi a dins feia que la fila de col·leccions trigués
+// ~17 s i Stremio la deixés en blanc. Sense KV (Cache API, per centre de
+// dades) el cron escriu en un altre centre i el catàleg no ho veuria mai,
+// així que hi mantenim la resolució en línia com a únic camí possible.
+function resolucionsEnCataleg() {
+    return kvMapa() ? 0 : CONFIG.maxResolucionsPerPeticio;
 }
 
 async function carregaMapa(forcar = false) {
@@ -197,33 +210,52 @@ async function carregaMapa(forcar = false) {
     // tenir en memòria una còpia més vella que la que ha desat una altra
     // acció d'assignació fa un moment — i mostrar com a pendent un títol
     // que ja s'ha resolt.
-    if (MAPA && !forcar) return MAPA;
-    MAPA = {};
+    //
+    // Amb KV, la còpia en memòria caduca al cap de MAPA_FRESC_MS: el cron hi
+    // escriu cada 10 min des d'un altre isolate, i sense caducitat el catàleg
+    // serviria per sempre la còpia amb què va arrencar l'isolate. No es
+    // recarrega mai amb canvis pendents de desar (es perdrien).
     const kv = kvMapa();
+    const caducat = Boolean(kv) && !MAPA_BRUT && Date.now() - MAPA_CARREGAT_TS > MAPA_FRESC_MS;
+    if (MAPA && !forcar && !caducat) return MAPA;
     try {
+        let dades = null;
         if (kv) {
-            const dades = await kv.get(MAPA_KV_KEY, "json");
-            if (dades) {
-                MAPA = dades;
-                console.log({ message: "Mapa carregat (KV)", entrades: Object.keys(MAPA).length });
-            }
-            return MAPA;
+            dades = await kv.get(MAPA_KV_KEY, "json");
+        } else if (typeof caches !== "undefined") {
+            if (!consumeix(1)) throw new Error("sense pressupost per llegir el mapa");
+            const resposta = await caches.default.match(new Request(MAPA_URL));
+            if (resposta) dades = await resposta.json();
         }
-        if (typeof caches === "undefined") return MAPA;
-        if (!consumeix(1)) return MAPA;
-        const resposta = await caches.default.match(new Request(MAPA_URL));
-        if (resposta) {
-            MAPA = await resposta.json();
-            console.log({ message: "Mapa carregat (Cache API, sense KV vinculat)", entrades: Object.keys(MAPA).length });
-        }
+        // S'assigna d'un sol cop: abans es posava MAPA = {} ABANS d'esperar
+        // la lectura, i una petició concurrent del mateix isolate el veia buit.
+        MAPA = dades || {};
+        MAPA_CARREGAT_TS = Date.now();
+        MAPA_NO_FIABLE = false;
+        INDEX_INVERS = null;
+        console.log({
+            message: kv ? "Mapa carregat (KV)" : "Mapa carregat (Cache API, sense KV vinculat)",
+            entrades: Object.keys(MAPA).length,
+        });
     } catch (e) {
         console.error({ message: "No s'ha pogut carregar el mapa", error: e.toString() });
+        // Si ja teníem una còpia, la seguim fent servir. Si no, treballem amb
+        // un mapa buit però PROHIBIM desar-lo: escriure'l sobreescriuria el
+        // persistent sencer i esborraria totes les caràtules resoltes.
+        if (!MAPA) {
+            MAPA = {};
+            MAPA_NO_FIABLE = true;
+        }
     }
     return MAPA;
 }
 
 async function desaMapa(ctx) {
     if (!MAPA_BRUT || !MAPA) return;
+    if (MAPA_NO_FIABLE) {
+        console.error({ message: "No es desa el mapa: la lectura havia fallat i el sobreescriuria" });
+        return;
+    }
     const kv = kvMapa();
     try {
         if (kv) {
@@ -379,6 +411,10 @@ const PAGINA_ADMIN = `<!DOCTYPE html>
 <div id="llista"></div>
 
 <script>
+// Totes les crides d'aquesta pàgina porten el token amb què s'ha obert (/admin?token=...)
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
+const fetchOriginal = window.fetch.bind(window);
+window.fetch = (u, o = {}) => fetchOriginal(u, { ...o, headers: { ...(o.headers || {}), 'X-Admin-Token': TOKEN } });
 async function carrega() {
   const r = await fetch('/admin/dades');
   const d = await r.json();
@@ -1136,7 +1172,9 @@ async function getTmdbMeta(type, id) {
 function cleanTitleForSearch(name) {
     const originalTitleMatch = name.match(/\(([A-Z][A-Za-z][\w\s:!?'&\-,.]{2,})\)/);
     const originalTitle = originalTitleMatch &&
-        !/(?:FLAC|DTS|cat|esp|eng|jap|val|cas|mal|sub|dub|BD|HD|AVC)/i.test(originalTitleMatch[1])
+        !/(?:FLAC|DTS|cat|esp|eng|jap|val|cas|mal|sub|dub|BD|HD|AVC)/i.test(originalTitleMatch[1]) &&
+        // "Macross Plus (OVAs)": un format, no el títol original
+        !/^(?:OVA|OAV|ONA|Movies?|Films?)s?$/i.test(originalTitleMatch[1].trim())
         ? originalTitleMatch[1].trim() : null;
 
     let senseExt = name.replace(/\.[a-z0-9]{3,4}$/i, "");
@@ -1154,6 +1192,7 @@ function cleanTitleForSearch(name) {
         .replace(/\((\d{4})\)/g, " ")
         .replace(/\([^)]*\d{4}[^)]*\)/g, " ")
         .replace(/\([^)]*(?:cat|esp|eng|jap|sub|dub|FLAC|DTS|AVC|BD|HD|by\s)[^)]*\)/gi, " ")
+        .replace(/\((?:OVA|OAV|ONA|Movie|Film)s?\)/gi, " ")
         .replace(/\b\d{3,4}p\b/gi, " ")
         .replace(/\b(?:BDRemux|BDRip|BluRay|WEB-?DL|WEBRip|HDRip|DVDRip|HDTV|CAM|REMUX|UHD(?:rip)?|UHDRemux|4K|DVDScr|TS)\b/gi, " ")
         .replace(/\b(?:x264|x265|h264|h265|HEVC|AVC|AAC|FLAC|DTS|Atmos|AC3|DoVi|HDR\d*)\b/gi, " ")
@@ -1223,8 +1262,11 @@ function cleanTitleForSearch(name) {
 // la propietat P345. Provem primer en català i després en castellà, perquè
 // molts títols d'aquest fons hi surten com "Los Bobobobs" o "El mundo de
 // Rumiko" encara que el fitxer estigui en català.
+// Retorna null quan la Viquipèdia NO té l'obra, i undefined quan no s'ha
+// pogut mirar (sense pressupost, error de xarxa, HTTP no-ok). La diferència
+// importa: un undefined no s'ha de desar com a intent fallit.
 async function imdbDesDeViquipedia(titol, any, wiki = "ca") {
-    if (!quedaPressupost(4)) return null;
+    if (!quedaPressupost(4)) return undefined;
     try {
         const cerca = any ? `${titol} ${any}` : titol;
         const params = new URLSearchParams({
@@ -1239,11 +1281,11 @@ async function imdbDesDeViquipedia(titol, any, wiki = "ca") {
             ppprop: "wikibase_item",
         });
 
-        if (!consumeix(1)) return null;
+        if (!consumeix(1)) return undefined;
         const res = await fetch(`https://${wiki}.wikipedia.org/w/api.php?${params}`, {
-            headers: { "User-Agent": "stremio-gdrive-addon-cat/1.0" },
+            headers: { "User-Agent": "stremio-gdrive-addon-cat/1.0 (https://github.com/sillyck/stremio-gdrive-addon-cat)" },
         });
-        if (!res.ok) return null;
+        if (!res.ok) return undefined;
         const data = await res.json();
         const pagines = data?.query?.pages || [];
 
@@ -1286,7 +1328,7 @@ async function imdbDesDeViquipedia(titol, any, wiki = "ca") {
         if (qids.length === 0) return null;
 
         // Una sola crida a Wikidata per a tots els candidats
-        if (!consumeix(1)) return null;
+        if (!consumeix(1)) return undefined;
         const wdParams = new URLSearchParams({
             action: "wbgetentities",
             ids: qids.join("|"),
@@ -1295,9 +1337,9 @@ async function imdbDesDeViquipedia(titol, any, wiki = "ca") {
             format: "json",
         });
         const wdRes = await fetch(`https://www.wikidata.org/w/api.php?${wdParams}`, {
-            headers: { "User-Agent": "stremio-gdrive-addon-cat/1.0" },
+            headers: { "User-Agent": "stremio-gdrive-addon-cat/1.0 (https://github.com/sillyck/stremio-gdrive-addon-cat)" },
         });
-        if (!wdRes.ok) return null;
+        if (!wdRes.ok) return undefined;
         const wdData = await wdRes.json();
 
         for (const qid of qids) {
@@ -1313,7 +1355,7 @@ async function imdbDesDeViquipedia(titol, any, wiki = "ca") {
         return null;
     } catch (e) {
         console.error({ message: "Viquipèdia ha fallat", wiki, titol, error: e.toString() });
-        return null;
+        return undefined;
     }
 }
 
@@ -1592,14 +1634,23 @@ async function imatgesPerImdb(imdbId) {
     }
 }
 
+// Tres resultats possibles:
+//   objecte    → trobat
+//   null       → buscat del tot i TMDB/Viquipèdia no el tenen
+//   undefined  → la cerca no s'ha pogut completar (sense pressupost de
+//                subpeticions, HTTP 429/5xx, excepció). NO és un fracàs:
+//                qui crida no l'ha de desar al mapa ni comptar-lo com a
+//                intent, perquè abans això marcava títols bons com a
+//                "sense caràtula" per sempre quan el cron esgotava la quota.
 async function getTmdbPosterByName(name, { preferTv = false } = {}) {
-    if (!CONFIG.tmdbApiKey) return null;
+    if (!CONFIG.tmdbApiKey) return undefined;
 
     const cacheKey = (preferTv ? "tv:" : "any:") + name.toLowerCase().trim();
     if (TMDB_CACHE.has(cacheKey)) return TMDB_CACHE.get(cacheKey);
 
-    const { queries, year } = cleanTitleForSearch(name);
+    const { queries, year, curt } = cleanTitleForSearch(name);
     if (queries.length === 0) return null;
+    let incomplet = false;
 
     const normalitza = (t) => (t || "")
         .toLowerCase()
@@ -1612,13 +1663,20 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
 
     // Proporció de paraules compartides. Rescata títols amb l'ordre canviat,
     // articles de més o subtítols afegits.
-    function solapament(a, b) {
+    // "divisor" Math.min mesura si un títol cap sencer dins l'altre;
+    // Math.max, quina part de l'altre representa.
+    function solapament(a, b, divisor = Math.min) {
         const A = new Set(normalitza(a).split(" ").filter((w) => w.length > 2));
         const B = new Set(normalitza(b).split(" ").filter((w) => w.length > 2));
-        if (A.size === 0 || B.size === 0) return 0;
+        // Amb una sola paraula significativa, "totes les paraules
+        // coincideixen" vol dir només que el títol la conté en algun lloc:
+        // la carpeta "_CAT SUB_" (consulta "SUB") casava amb la sèrie
+        // "Yemin-SUB" i en mostrava la caràtula. Els títols d'una paraula
+        // ja es resolen per igualtat o prefix a puntua().
+        if (Math.min(A.size, B.size) < 2) return 0;
         let comuns = 0;
         for (const w of A) if (B.has(w)) comuns++;
-        return comuns / Math.min(A.size, B.size);
+        return comuns / divisor(A.size, B.size);
     }
 
     function puntua(result, consulta) {
@@ -1633,8 +1691,11 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
         if (cand.some((c) => compacta(c) === qC)) return 3;
         if (candN.some((c) => c.startsWith(q) || q.startsWith(c))) return 2;
         if (cand.some((c) => compacta(c).startsWith(qC) || qC.startsWith(compacta(c)))) return 2;
-        // Totes les paraules significatives d'un títol són a l'altre
-        if (cand.some((c) => solapament(c, consulta) >= 0.99)) return 2;
+        // Totes les paraules significatives d'un títol són a l'altre, i són
+        // almenys la meitat de les d'aquest. Sense la segona condició,
+        // "Summer Wars" casava amb "LEGO Star Wars Summer Vacation".
+        if (cand.some((c) => solapament(c, consulta) >= 0.99
+            && solapament(c, consulta, Math.max) >= 0.5)) return 2;
         if (candN.some((c) => c.includes(q) || q.includes(c))) return 1;
         if (cand.some((c) => solapament(c, consulta) >= 0.6)) return 1;
         return 0;
@@ -1657,9 +1718,9 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
                 language: "ca-ES",
             });
             if (year) params.set(endpoint === "tv" ? "first_air_date_year" : "year", year);
-            if (!consumeix(1)) return null;
+            if (!consumeix(1)) { incomplet = true; return null; }
             const res = await fetch(`https://api.themoviedb.org/3/search/${endpoint}?${params}`);
-            if (!res.ok) return null;
+            if (!res.ok) { incomplet = true; return null; }
             const data = await res.json();
             const results = data.results || [];
 
@@ -1679,6 +1740,10 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
                 if (preferTv && mt === "movie") continue;
 
                 const score = puntua(r, q);
+                // El candidat curt (3 primeres paraules) només val si és el
+                // títol EXACTE: com a prefix, "El món de" (de "El món de
+                // Rumiko") casava amb "El món de Pepe Rubianes".
+                if (q === curt && score < 3) continue;
                 // PUNTUACIÓ MÍNIMA 2. Amb 1 n'hi havia prou que un títol
                 // contingués l'altre o compartissin un 60% de paraules, i
                 // això colava obres sense cap relació. Pitjor encara: el
@@ -1713,7 +1778,7 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
         // específic a més curt. Ens aturem en trobar una coincidència exacta.
         let millor = null;
         for (const q of queries) {
-            if (!quedaPressupost(5)) break;
+            if (!quedaPressupost(5)) { incomplet = true; break; }
             const m = await cercaTmdb(q);
             if (m && (!millor || m.total > millor.total)) millor = m;
             if (millor && millor.score === 3 && millor.total >= 3.4) break;
@@ -1721,11 +1786,14 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
 
         // NIVELL 2: sense accents. "Anastàsia" → "Anastasia" casa directament
         // amb el títol que TMDB té indexat en molts casos.
-        if ((!millor || millor.score < 3) && quedaPressupost(5)) {
+        if (!millor || millor.score < 3) {
             const sa = senseAccents(queries[0]);
             if (sa !== queries[0]) {
-                const alt = await cercaTmdb(sa);
-                if (alt && (!millor || alt.total > millor.total)) millor = alt;
+                if (!quedaPressupost(5)) incomplet = true;
+                else {
+                    const alt = await cercaTmdb(sa);
+                    if (alt && (!millor || alt.total > millor.total)) millor = alt;
+                }
             }
         }
 
@@ -1733,8 +1801,9 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
         // És l'únic camí fiable per als títols que TMDB no té traduïts.
         if ((!millor || millor.score < 2)) {
             for (const wiki of ["ca", "es"]) {
-                if (!quedaPressupost(4)) break;
+                if (!quedaPressupost(4)) { incomplet = true; break; }
                 const viqui = await imdbDesDeViquipedia(queries[0], year, wiki);
+                if (viqui === undefined) incomplet = true;
                 if (viqui?.imdbId) {
                     // Tenim l'ID d'IMDb però encara no la caràtula: la demanem
                     // a TMDB per ID, que és una cerca exacta i sempre encerta.
@@ -1758,6 +1827,7 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
         }
 
         if (!millor) {
+            if (incomplet) return undefined;
             TMDB_CACHE.set(cacheKey, null);
             return null;
         }
@@ -1776,8 +1846,15 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
                     .replace("{apiKey}", CONFIG.tmdbApiKey);
                 const extRes = await fetch(extUrl);
                 if (extRes.ok) imdbId = (await extRes.json()).imdb_id || null;
-            } catch (e) { /* ignore */ }
+                else incomplet = true;
+            } catch (e) { incomplet = true; }
+        } else {
+            incomplet = true;
         }
+        // Tenim la fitxa però no hem pogut demanar l'IMDb ID: sense ell els
+        // streams des d'AIOMetadata no troben la carpeta. Millor reintentar
+        // sencer la propera vegada que desar-lo a mitges.
+        if (!imdbId && incomplet) return undefined;
 
         const out = {
             // TMDB serveix les imatges des d'un CDN sense clau ni límits, i la
@@ -1802,7 +1879,7 @@ async function getTmdbPosterByName(name, { preferTv = false } = {}) {
         return out;
     } catch (e) {
         console.error({ message: "getTmdbPosterByName ha fallat", name, error: e.toString() });
-        return null;
+        return undefined;
     }
 }
 
@@ -2265,6 +2342,11 @@ function esSerieGermana(nomCarpeta, titolsNorm) {
         // és una part de la mateixa sèrie.
         const primera = extra[0];
         if (MARQUES_DIVISIO.has(primera) || /^\d+$/.test(primera)) return false;
+        // Marques de temporada/capítol enganxades: "T1xC", "S01", "S01E",
+        // "1x". "Inazuma Eleven T1xC" és una carpeta de la mateixa sèrie
+        // amb una altra convenció de nom, no una sèrie germana; tractar-la
+        // com a germana li donava afinitat 0 i els seus episodis no sortien.
+        if (/^(?:[st]\d{1,2}(?:x?[ce]\d{0,3})?|\d{1,2}x\d{0,3})$/.test(primera)) return false;
         // Altrament, el títol s'allarga amb paraules pròpies: és una altra obra
         return true;
     }
@@ -3007,6 +3089,8 @@ function dedupMetas(metas) {
     return [...vistos.values()];
 }
 
+const RUTES_ADMIN = /^\/(?:omplir|buidar|esborra|admin(?:\/.*)?)$/;
+
 async function handleRequest(request) {
     try {
         const url = new URL(
@@ -3014,6 +3098,24 @@ async function handleRequest(request) {
         );
         globalThis.playbackUrl = url.origin + "/playback";
         globalThis.__origin = url.origin;
+
+        // Rutes que escriuen o esborren el mapa, o que gasten la quota de
+        // subpeticions: abans eren obertes a qualsevol que conegués la URL
+        // (un GET a /buidar esborrava totes les caràtules). Cal el secret
+        // ADMIN_TOKEN (wrangler secret put ADMIN_TOKEN) com a ?token= o a la
+        // capçalera X-Admin-Token. El cron crida /omplir internament amb
+        // l'amfitrió gdrive-addon.local, que mai arriba des de fora.
+        if (RUTES_ADMIN.test(url.pathname) && url.hostname !== "gdrive-addon.local") {
+            const esperat = globalThis.__env?.ADMIN_TOKEN;
+            const donat = url.searchParams.get("token") || request.headers.get("X-Admin-Token");
+            if (!esperat || donat !== esperat) {
+                return createJsonResponse({
+                    error: esperat
+                        ? "Token d'administració incorrecte o absent (?token=...)."
+                        : "Administració desactivada: defineix el secret ADMIN_TOKEN (npx wrangler secret put ADMIN_TOKEN).",
+                }, 403);
+            }
+        }
 
         if (url.pathname === "/manifest.json") {
             const manifest = MANIFEST;
@@ -3168,6 +3270,7 @@ async function handleRequest(request) {
                     if (previ && !calReintentar(previ)) continue;
                     if (!quedaPressupost(8)) { pendents++; continue; }
                     const r = await getTmdbPosterByName(entrada.nom, { preferTv: true });
+                    if (r === undefined) { pendents++; continue; }
                     const colisio = r?.imdbId && imdbIdJaUsatPerUnaAltraClau(r.imdbId, entrada.clau);
                     if (colisio) {
                         console.log({ message: "imdbId ja assignat a una altra sèrie: es queda sense resoldre", clau: entrada.clau, nom: entrada.nom, imdbId: r.imdbId });
@@ -3196,6 +3299,7 @@ async function handleRequest(request) {
                     if (previ && !calReintentar(previ)) continue;
                     if (!quedaPressupost(8)) { pendents++; continue; }
                     const r = await getTmdbPosterByName(file.name);
+                    if (r === undefined) { pendents++; continue; }
                     escriuMapa("m:" + file.id, r?.imdbId
                         ? { imdbId: r.imdbId, poster: r.poster, background: r.background, title: r.title, overview: r.overview || null }
                         : { imdbId: null, poster: r?.poster || null, background: r?.background || null,
@@ -3220,11 +3324,17 @@ async function handleRequest(request) {
                         if (jaFetes.has(folder.id)) continue;
 
                         const pelis = await recullPelisDeColeccio(folder.id, accessToken);
+                        // Només donem la carpeta per revisada si s'hi han
+                        // pogut mirar TOTES les pel·lícules. Abans es marcava
+                        // igualment en quedar-se sense pressupost a mig camí
+                        // i les restants no es tornaven a visitar mai.
+                        let completa = true;
                         for (const p of pelis) {
                             const clau = "m:" + p.file.id;
                             if (llegeixMapa(clau)) continue;
-                            if (!quedaPressupost(8)) break;
+                            if (!quedaPressupost(8)) { completa = false; break; }
                             const r = await getTmdbPosterByName(p.file.name);
+                            if (r === undefined) { completa = false; continue; }
                             escriuMapa(clau, {
                                 imdbId: r?.imdbId || null,
                                 poster: r?.poster || null,
@@ -3239,7 +3349,7 @@ async function handleRequest(request) {
                             pelisColeccio++;
                         }
 
-                        jaFetes.add(folder.id);
+                        if (completa) jaFetes.add(folder.id);
                         revisades++;
                         if (pelis.length) {
                             console.log({
@@ -3534,13 +3644,16 @@ ${acabat
             let dades = llegeixMapa("m:" + id);
             if (!dades && permetResoldre && quedaPressupost(6)) {
                 const tmdb = await getTmdbPosterByName(name);
-                dades = tmdb
-                    ? {
-                        imdbId: tmdb.imdbId, poster: tmdb.poster, background: tmdb.background,
-                        title: tmdb.title, overview: tmdb.overview || null,
-                    }
-                    : { imdbId: null, poster: null, background: null, title: null, overview: null };
-                escriuMapa("m:" + id, dades);
+                // undefined = cerca a mitges: no es desa, es reintentarà.
+                if (tmdb !== undefined) {
+                    dades = tmdb
+                        ? {
+                            imdbId: tmdb.imdbId, poster: tmdb.poster, background: tmdb.background,
+                            title: tmdb.title, overview: tmdb.overview || null,
+                        }
+                        : { imdbId: null, poster: null, background: null, title: null, overview: null };
+                    escriuMapa("m:" + id, dades);
+                }
             }
             if (dades?.imdbId) {
                 IMDB_TO_GDRIVE.set(dades.imdbId, { type: "movie", id });
@@ -3719,9 +3832,10 @@ ${acabat
                 // mentre quedi pressupost de subpeticions
                 let resoltesAra = 0;
                 for (const entrada of pendents) {
-                    if (resoltesAra >= CONFIG.maxResolucionsPerPeticio) break;
+                    if (resoltesAra >= resolucionsEnCataleg()) break;
                     if (!quedaPressupost(6)) break;
                     const tmdb = await getTmdbPosterByName(entrada.nom, { preferTv: true });
+                    if (tmdb === undefined) break;
                     const colisio = tmdb?.imdbId && imdbIdJaUsatPerUnaAltraClau(tmdb.imdbId, entrada.clau);
                     const dades = (tmdb && !colisio)
                         ? {
@@ -3839,7 +3953,7 @@ ${acabat
                 const totsMetas = [];
                 for (const file of results.files) {
                     const potResoldre =
-                        resoltesAra < CONFIG.maxResolucionsPerPeticio && quedaPressupost(6);
+                        resoltesAra < resolucionsEnCataleg() && quedaPressupost(6);
                     const abans = PRESSUPOST;
                     totsMetas.push(await createMetaObject(
                         file.id, file.name, file.size, file.thumbnailLink, file.createdTime,
@@ -4428,11 +4542,13 @@ async function getStreams(streamRequest) {
 
                 for (const { id: folderIdBrut, score: afinitat } of carpetesOrdenades) {
                     // Si ja tenim resultats d'una carpeta que encaixa bé DE
-                    // DEBÒ (afinitat 3, nom confirmat), no seguim: la resta
-                    // són probablement associacions errònies. Amb resultats
-                    // però sense cap confirmació de nom (afinitat < 3),
-                    // seguim mirant — podria ser una segona carpeta legítima.
-                    if (millorAfinitatAmbResultats === 3 && afinitat < 3) break;
+                    // DEBÒ (afinitat 3, nom confirmat), només seguim per les
+                    // d'afinitat 2 (mateix títol amb una altra convenció de
+                    // nom, ex. "Inazuma Eleven T1xC"): són una segona versió
+                    // legítima. Les d'afinitat 0 (sèrie germana, ex. "Inazuma
+                    // Eleven Go") o 1 (nom il·legible) són probablement
+                    // associacions errònies i les deixem estar.
+                    if (millorAfinitatAmbResultats === 3 && afinitat < 2) break;
                     if (!quedaPressupost(6)) {
                         console.log({ message: "Sense pressupost per revisar la resta de carpetes", imdbId });
                         break;
@@ -4679,7 +4795,13 @@ export default {
         await carregaMapa();
         const clausAbans = new Set(Object.keys(MAPA || {}));
 
-        const PASSADES = 8;
+        // UNA passada per invocació. Abans n'hi havia 8 seguides i es
+        // reiniciava el nostre comptador a cada una, però Cloudflare en dona
+        // 50 per a TOTA la invocació: a partir de la 1a, cada crida petava
+        // amb "Too many subrequests" i /omplir ho desava com a intent fallit,
+        // fins que al 3r dia el títol quedava sense caràtula per sempre.
+        // El ritme el marca ara el cron (wrangler.toml: cada 10 minuts).
+        const PASSADES = 1;
         for (let i = 0; i < PASSADES; i++) {
             reiniciaPressupost(46);
             try {
