@@ -140,6 +140,7 @@ async function fetchFals(x, u) {
     else if (url.hostname === "api.themoviedb.org") tipus = "tmdb";
     else if (url.hostname.endsWith("wikipedia.org")) tipus = "viquipedia";
     else if (url.hostname === "www.wikidata.org") tipus = "wikidata";
+    else if (url.hostname === "v3-cinemeta.strem.io") tipus = "cinemeta";
     x.crides.push({ tipus, url: s });
     x.perInvocacio++;
     if (x.perInvocacio > x.limit) throw new Error("Too many subrequests.");
@@ -189,6 +190,11 @@ async function fetchFals(x, u) {
         // El codi afegeix l'any a la cerca; el traiem per trobar la clau
         const clau = `${lang}:${cerca.replace(/\s+(?:19|20)\d{2}$/, "")}`;
         return json({ query: { pages: x.viqui.get(clau) || [] } });
+    }
+
+    if (tipus === "cinemeta") {
+        const id = /\/meta\/\w+\/(tt\d+)\.json$/.exec(url.pathname)?.[1];
+        return json({ meta: { id, name: "Títol de Cinemeta", year: "2000", type: "movie" } });
     }
 
     if (tipus === "wikidata") {
@@ -980,6 +986,171 @@ prova("Cerca amb KV: no resol en línia ni escriu; els no resolts surten amb car
     assert.equal(kv.escriptures, 0);
     assert.equal(x.compta("tmdb"), 0);
     assert.ok(metas.every((m) => m.poster.includes("&r=pelicula")), JSON.stringify(metas.map((m) => m.poster)));
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+seccio("Pel·lícules: una sola caràtula per obra, totes les còpies a dins");
+
+// Noms de fitxer reals del Drive
+const CM = { tmdb: [{ id: 38142, title: "5 centímetres per segon", release_date: "2007-03-03", media_type: "movie", poster_path: "/5cm.jpg" }], imdb: "tt0983213" };
+const AK = { tmdb: [{ id: 149, title: "Akira", release_date: "1988-07-16", media_type: "movie", poster_path: "/akira.jpg" }], imdb: "tt0094625" };
+const COPIES = [
+    { id: "C1", nom: "5 centimetres per segon (2007) [cat-jap-esp][1080p WebDL AnimeBox].mkv", ...CM },
+    { id: "C2", nom: "5 centímetres per segon [1080p BD Remux][Cat-Esp-Jap][dani98].mkv", ...CM },
+    { id: "C3", nom: "5 centímetres per segon [CAT].mp4", ...CM },
+    { id: "A1", nom: "Akira (1988) [4K esp-cat-eng-jap].mkv", ...AK },
+    { id: "A2", nom: "Akira (1988) [BDRemux AVC 1080p DTS-HD MA 5.1 Esp-Cat TrueHD 5.1 Jap].mkv", ...AK },
+    // Remakes: mateix títol, anys diferents → dues obres
+    { id: "L1", nom: "Aladí (1992) [cat].mkv", imdb: "tt0103639",
+      tmdb: [{ id: 812, title: "Aladí", release_date: "1992-11-25", media_type: "movie", poster_path: "/aladi92.jpg" }] },
+    { id: "L2", nom: "Aladí (2019) [1080p].mkv", imdb: "tt6139732",
+      tmdb: [{ id: 420817, title: "Aladí", release_date: "2019-05-22", media_type: "movie", poster_path: "/aladi19.jpg" }] },
+    // El cas que ja havia fet mal: un extra NO és la pel·lícula
+    { id: "P1", nom: "Plastic Little.mkv", imdb: null, tmdb: [] },
+    { id: "P2", nom: "Plastic Little Promotional Video.mkv", imdb: null, tmdb: [] },
+];
+
+async function catalegPelis(x, kv) {
+    const iso = nouIsolate(x);
+    return (await (await crida(iso, x, entorn(kv), "/catalog/movie/gdrive_list.json")).json()).metas;
+}
+
+prova("Sense resoldre: les 3 còpies de \"5 centímetres per segon\" són UNA entrada", async () => {
+    const x = xarxaFalsa({ series: [], pelis: COPIES });
+    const metas = await catalegPelis(x, kvFals());
+    const cm = metas.filter((m) => /centimetres|centímetres/i.test(m.name));
+    assert.equal(cm.length, 1, JSON.stringify(cm.map((m) => m.name)));
+    assert.equal(cm[0].id, "gdrive:C1:C2:C3");
+    assert.match(cm[0].description, /^3 versions disponibles/);
+});
+
+prova("Sense resoldre: les 2 còpies d'Akira són UNA entrada", async () => {
+    const x = xarxaFalsa({ series: [], pelis: COPIES });
+    const metas = await catalegPelis(x, kvFals());
+    const ak = metas.filter((m) => /akira/i.test(m.name));
+    assert.equal(ak.length, 1);
+    assert.equal(ak[0].id, "gdrive:A1:A2");
+});
+
+prova("Remakes amb anys diferents (Aladí 1992 / 2019) NO es fusionen", async () => {
+    const x = xarxaFalsa({ series: [], pelis: COPIES });
+    const metas = await catalegPelis(x, kvFals());
+    assert.equal(metas.filter((m) => /alad/i.test(m.name)).length, 2);
+});
+
+prova("Un extra (\"Plastic Little Promotional Video\") NO es fusiona amb la pel·lícula", async () => {
+    const x = xarxaFalsa({ series: [], pelis: COPIES });
+    const metas = await catalegPelis(x, kvFals());
+    assert.equal(metas.filter((m) => /plastic little/i.test(m.name)).length, 2);
+});
+
+prova("Cap entrada mostra el nom del fitxer cru (sense extensió ni etiquetes de qualitat)", async () => {
+    const x = xarxaFalsa({ series: [], pelis: COPIES });
+    const metas = await catalegPelis(x, kvFals());
+    for (const m of metas) {
+        assert.doesNotMatch(m.name, /\.(mkv|mp4|avi)\b|1080p|BDRemux|WebDL|dani98/i, m.name);
+    }
+    assert.ok(metas.some((m) => m.name === "5 centimetres per segon (2007) [CAT]"), JSON.stringify(metas.map((m) => m.name)));
+    assert.ok(metas.some((m) => m.name === "Akira (1988) [CAT]"));
+});
+
+prova("Obrir l'entrada agrupada → Stremio pot triar entre les 3 còpies", async () => {
+    const x = xarxaFalsa({ series: [], pelis: COPIES });
+    const iso = nouIsolate(x);
+    const { streams } = await (await crida(iso, x, entorn(kvFals()), "/stream/movie/gdrive:C1:C2:C3.json")).json();
+    assert.equal(streams.length, 3);
+});
+
+prova("Fitxa de l'entrada agrupada: títol net, mateix ID i nombre de versions", async () => {
+    const x = xarxaFalsa({ series: [], pelis: COPIES });
+    const iso = nouIsolate(x);
+    const { meta } = await (await crida(iso, x, entorn(kvFals()), "/meta/movie/gdrive:A1:A2.json")).json();
+    assert.equal(meta.id, "gdrive:A1:A2");
+    assert.equal(meta.name, "Akira (1988) [CAT]");
+    assert.match(meta.description, /^2 versions disponibles/);
+});
+
+prova("Un cop resoltes: UNA entrada amb l'IMDb, que obre la fitxa rica de Cinemeta/AIOMetadata", async () => {
+    const x = xarxaFalsa({ series: [], pelis: COPIES });
+    const kv = kvFals();
+    for (let i = 0; i < 3; i++) {
+        const iso = nouIsolate(x);
+        preparaRespostes(x, iso.t, { series: [], pelis: COPIES });
+        await cron(iso, x, entorn(kv));
+    }
+    const metas = await catalegPelis(x, kv);
+    assert.equal(metas.filter((m) => m.id === "tt0983213").length, 1);
+    assert.equal(metas.filter((m) => m.id === "tt0094625").length, 1);
+    assert.ok(!metas.some((m) => /^gdrive:C|^gdrive:A/.test(m.id)), "no hi pot haver còpies soltes");
+    assert.equal(metas.find((m) => m.id === "tt0983213").poster, posterTmdb("/5cm.jpg"));
+    // Les dues Aladí queden separades i cadascuna amb la seva caràtula
+    assert.equal(metas.find((m) => m.id === "tt0103639")?.poster, posterTmdb("/aladi92.jpg"));
+    assert.equal(metas.find((m) => m.id === "tt6139732")?.poster, posterTmdb("/aladi19.jpg"));
+});
+
+prova("Un cop resoltes: obrir-la per IMDb llista TOTES les còpies per triar", async () => {
+    const x = xarxaFalsa({ series: [], pelis: COPIES });
+    const kv = kvFals();
+    for (let i = 0; i < 3; i++) {
+        const iso = nouIsolate(x);
+        preparaRespostes(x, iso.t, { series: [], pelis: COPIES });
+        await cron(iso, x, entorn(kv));
+    }
+    const iso = nouIsolate(x);
+    const { streams } = await (await crida(iso, x, entorn(kv), "/stream/movie/tt0983213.json")).json();
+    assert.equal(streams.length, 3, JSON.stringify(streams.map((s) => s.name || s.title)));
+});
+
+prova("El cron resol les còpies d'un mateix títol amb UNA sola cerca", async () => {
+    const x = xarxaFalsa({ series: [], pelis: COPIES });
+    const kv = kvFals();
+    const iso = nouIsolate(x);
+    preparaRespostes(x, iso.t, { series: [], pelis: COPIES });
+    await cron(iso, x, entorn(kv));
+    const cerquesAkira = x.crides.filter((c) => c.tipus === "tmdb" && /search/.test(c.url) && /query=Akira/.test(c.url)).length;
+    assert.equal(cerquesAkira, 1);
+    const m = kv.mapa();
+    assert.equal(m["m:A1"]?.imdbId, "tt0094625");
+    assert.equal(m["m:A2"]?.imdbId, "tt0094625");
+});
+
+prova("Amb 300 sèries pendents, les pel·lícules també avancen a cada passada", async () => {
+    const grans = moltesSeries(300);
+    const x = xarxaFalsa({ series: grans, pelis: COPIES });
+    const kv = kvFals();
+    const iso = nouIsolate(x);
+    preparaRespostes(x, iso.t, { series: grans, pelis: COPIES });
+    await cron(iso, x, entorn(kv));
+    const pelis = Object.entries(kv.mapa()).filter(([k, v]) => k.startsWith("m:") && v?.imdbId).length;
+    assert.ok(pelis >= 3, `només ${pelis} pel·lícules resoltes`);
+    assert.ok(x.perInvocacio <= LIMIT_CLOUDFLARE);
+});
+
+prova("Amb el mapa complet, el cron cada minut no escriu al KV (límit de 1.000 escriptures/dia)", async () => {
+    const x = xarxaFalsa({ series: [serie("F_3X3")], pelis: COPIES.slice(0, 2) });
+    const kv = kvFals();
+    for (let i = 0; i < 4; i++) {
+        const iso = nouIsolate(x);
+        preparaRespostes(x, iso.t, { series: [serie("F_3X3")], pelis: COPIES.slice(0, 2) });
+        iso.t.CONFIG.cercaPelisDinsColeccions = true;
+        await cron(iso, x, entorn(kv));
+    }
+    const escriptures = kv.escriptures;
+    for (let i = 0; i < 5; i++) {
+        const iso = nouIsolate(x);
+        preparaRespostes(x, iso.t, { series: [serie("F_3X3")], pelis: COPIES.slice(0, 2) });
+        iso.t.CONFIG.cercaPelisDinsColeccions = true;
+        await cron(iso, x, entorn(kv));
+    }
+    assert.equal(kv.escriptures, escriptures, `${kv.escriptures - escriptures} escriptures sense canvis`);
+});
+
+prova("Fitxa d'una franquícia (ID amb \"+\") s'obre en lloc de donar 400", async () => {
+    const x = xarxaFalsa({ series: [], pelis: [], extra: { F_X1: [], F_X2: [], ARREL_SERIES: [
+        { id: "F_X1", name: "Inuyasha", mimeType: FOLDER }, { id: "F_X2", name: "Inuyasha Pelis", mimeType: FOLDER }] } });
+    const iso = nouIsolate(x);
+    const res = await crida(iso, x, entorn(kvFals()), `/meta/series/${encodeURIComponent("gdriveshow:F_X1+F_X2")}.json`);
+    assert.equal(res.status, 200);
 });
 
 // ═════════════════════════════════════════════════════════════════════════════

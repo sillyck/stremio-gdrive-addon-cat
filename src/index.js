@@ -54,6 +54,9 @@ const CONFIG = {
     // Carpetes de sèries que /omplir comprova com a possible franquícia per
     // passada (1 subpetició cadascuna). Deixa ~30 de pressupost per a TMDB.
     maxDeteccionsPerPassada: 12,
+    // Sèries resoltes per passada: la resta del pressupost és per a les
+    // pel·lícules, que així avancen alhora en lloc d'esperar-les totes.
+    maxSeriesPerPassada: 6,
 
     // Memòria cau del recorregut de col·leccions. Desactivada mentre
     // comprovem els filtres d'extres: així cada petició recorre el Drive de
@@ -103,7 +106,7 @@ const CONFIG = {
 
 // Identificador de la versió del codi. Serveix per verificar via /versio
 // quina versió s'està executant realment al worker.
-const VERSIO_CODI = "2026-09-28.caratules-a-demanda";
+const VERSIO_CODI = "2026-09-28.pelis-agrupades";
 
 const MANIFEST = {
     id: "stremio.gdrive.worker.cat",
@@ -542,11 +545,13 @@ const API_ENDPOINTS = {
 };
 
 const REGEX_PATTERNS = {
-    validStreamRequest: /\/stream\/(movie|series)\/([a-zA-Z0-9%:\-_]+)\.json/,
+    // "+" hi ha de ser: la URL es descodifica abans de comparar, i els IDs de
+    // franquícia ("gdriveshow:idA+idB") donaven 400 i no es podien obrir.
+    validStreamRequest: /\/stream\/(movie|series)\/([a-zA-Z0-9%:\-_+]+)\.json/,
     validPlaybackRequest: /\/playback\/([a-zA-Z0-9%:\-_]+)\/(.+)/,
     validCatalogRequest:
         /\/catalog\/(movie|series)\/([a-zA-Z0-9%:\-_]+)(\/search=(.+))?\.json/,
-    validMetaRequest: /\/meta\/(movie|series)\/([a-zA-Z0-9%:\-_]+)\.json/,
+    validMetaRequest: /\/meta\/(movie|series)\/([a-zA-Z0-9%:\-_+]+)\.json/,
     resolutions: {
         "2160p": /(?<![^ [(_\-.])(4k|2160p|uhd)(?=[ \)\]_.-]|$)/i,
         "1080p": /(?<![^ [(_\-.])(1080p|fhd)(?=[ \)\]_.-]|$)/i,
@@ -1261,7 +1266,7 @@ function cleanTitleForSearch(name) {
         afegeix(curt);
     }
 
-    return { queries: candidats, year, curt };
+    return { queries: candidats, year, curt, net: cleanedName };
 }
 
 // ── Resolució de títols en català ─────────────────────────────────────────
@@ -3126,6 +3131,57 @@ function dedupMetas(metas) {
     return [...vistos.values()];
 }
 
+// Títol net d'un nom de fitxer ("Akira (1988) [4K esp-cat].mkv" → "Akira
+// (1988)"): el que es mostra a Stremio en lloc del nom del fitxer, i la clau
+// per reconèixer còpies de la mateixa pel·lícula.
+function titolDeFitxer(nom) {
+    const { net, year } = cleanTitleForSearch(nom || "");
+    const base = (net || "").trim();
+    return {
+        titol: base ? (year ? `${base} (${year})` : base) : nom,
+        clau: normalitzaTitol(base),
+        any: year || "",
+    };
+}
+
+// Agrupa les pel·lícules encara sense IMDb que són còpies de la mateixa obra
+// en UNA entrada "gdrive:<id1>:<id2>…": a dins, Stremio les llista totes per
+// triar-ne una. Les que ja tenen IMDb les agrupa dedupMetas() per aquest ID.
+// Només per títol netejat IDÈNTIC, mai per prefix (el motiu és a
+// dedupMetas), i si hi ha anys diferents es mantenen separades (remakes);
+// les còpies sense any van amb el grup del títol si només n'hi ha un.
+function agrupaCopies(parells) {
+    const sortida = [];
+    const perClau = new Map();   // clau → Map(any → [{meta, file}])
+    for (const p of parells) {
+        if (!p.meta.id.startsWith("gdrive:")) { sortida.push(p.meta); continue; }
+        const { clau, any } = titolDeFitxer(p.file.name);
+        if (!clau) { sortida.push(p.meta); continue; }
+        if (!perClau.has(clau)) perClau.set(clau, new Map());
+        const perAny = perClau.get(clau);
+        if (!perAny.has(any)) perAny.set(any, []);
+        perAny.get(any).push(p);
+    }
+    for (const perAny of perClau.values()) {
+        const senseAny = perAny.get("") || [];
+        const ambAny = [...perAny.entries()].filter(([a]) => a).map(([, g]) => g);
+        const grups = ambAny.length === 1
+            ? [[...ambAny[0], ...senseAny]]
+            : [...ambAny, ...(senseAny.length ? [senseAny] : [])];
+        for (const g of grups) {
+            // La que porta any dona el títol més complet ("Akira (1988)")
+            const rep = g.find((p) => titolDeFitxer(p.file.name).any) || g[0];
+            const meta = { ...rep.meta };
+            if (g.length > 1) {
+                meta.id = "gdrive:" + g.map((p) => p.file.id).join(":");
+                meta.description = `${g.length} versions disponibles\n\n${meta.description || ""}`.trim();
+            }
+            sortida.push(meta);
+        }
+    }
+    return sortida;
+}
+
 const RUTES_ADMIN = /^\/(?:omplir|buidar|esborra|admin(?:\/.*)?)$/;
 
 async function handleRequest(request) {
@@ -3316,6 +3372,7 @@ async function handleRequest(request) {
 
             // ── Sèries ────────────────────────────────────────────────────
             const quota = { deteccions: CONFIG.maxDeteccionsPerPassada };
+            let seriesAra = 0;
             for (const rootId of CONFIG.collectionsRootFolderIds) {
                 let entrades = [];
                 try { entrades = await obtenirEntradesDeColleccio(rootId, accessToken, quota); }
@@ -3328,9 +3385,13 @@ async function handleRequest(request) {
                     // reconeixement va millorant, així que els reintentem
                     // unes quantes vegades abans de donar-los per perduts.
                     if (previ && !calReintentar(previ)) continue;
+                    // Sostre per passada: si no, amb ~300 sèries pendents les
+                    // pel·lícules no rebien pressupost fins al final.
+                    if (seriesAra >= CONFIG.maxSeriesPerPassada) { pendents++; continue; }
                     if (!quedaPressupost(8)) { pendents++; continue; }
                     const r = await getTmdbPosterByName(entrada.nom, { preferTv: true });
                     if (r === undefined) { pendents++; continue; }
+                    seriesAra++;
                     const colisio = r?.imdbId && imdbIdJaUsatPerUnaAltraClau(r.imdbId, entrada.clau);
                     if (colisio) {
                         console.log({ message: "imdbId ja assignat a una altra sèrie: es queda sense resoldre", clau: entrada.clau, nom: entrada.nom, imdbId: r.imdbId });
@@ -3354,12 +3415,24 @@ async function handleRequest(request) {
                 } catch (e) { continue; }
                 const videos = fitxers.filter((f) => VIDEO_EXT_REGEX.test(f.name));
                 totalPelis += videos.length;
+                // Les còpies d'una mateixa pel·lícula (mateix títol net i any)
+                // comparteixen resultat: una sola cerca, i totes queden amb
+                // el mateix IMDb a la vegada (i s'agrupen al catàleg).
+                const perTitol = new Map();
                 for (const file of videos) {
                     const previ = llegeixMapa("m:" + file.id);
                     if (previ && !calReintentar(previ)) continue;
-                    if (!quedaPressupost(8)) { pendents++; continue; }
-                    const r = await getTmdbPosterByName(file.name);
-                    if (r === undefined) { pendents++; continue; }
+                    const t = titolDeFitxer(file.name);
+                    const clauT = t.clau ? `${t.clau}|${t.any}` : null;
+                    let r;
+                    if (clauT && perTitol.has(clauT)) {
+                        r = perTitol.get(clauT);
+                    } else {
+                        if (!quedaPressupost(8)) { pendents++; continue; }
+                        r = await getTmdbPosterByName(file.name);
+                        if (r === undefined) { pendents++; continue; }
+                        if (clauT) perTitol.set(clauT, r);
+                    }
                     escriuMapa("m:" + file.id, r?.imdbId
                         ? { imdbId: r.imdbId, poster: r.poster, background: r.background, title: r.title, overview: r.overview || null }
                         : { imdbId: null, poster: r?.poster || null, background: r?.background || null,
@@ -3420,9 +3493,14 @@ async function handleRequest(request) {
                         }
                     }
                 }
+                // Només si ha canviat: amb el cron cada minut, marcar-ho sempre
+                // eren 1.440 escriptures al KV al dia (el pla gratuït en
+                // permet 1.000) encara que no hi hagués res de nou.
                 if (!MAPA) MAPA = {};
-                MAPA.__coleccionsRevisades = [...jaFetes];
-                MAPA_BRUT = true;
+                if (jaFetes.size !== (MAPA.__coleccionsRevisades || []).length) {
+                    MAPA.__coleccionsRevisades = [...jaFetes];
+                    MAPA_BRUT = true;
+                }
             }
 
             await desaMapa(null);
@@ -3727,7 +3805,9 @@ ${acabat
                     : "");
             return {
                 id: dades?.imdbId ? dades.imdbId : `gdrive:${id}`,
-                name: ambEtiquetaCat(dades?.title || name),
+                // Mai el nom del fitxer cru: si TMDB encara no l'ha resolt,
+                // el títol netejat ("Akira (1988)")
+                name: ambEtiquetaCat(dades?.title || titolDeFitxer(name).titol),
                 type: "movie",
                 posterShape: "poster",
                 poster: dades?.poster
@@ -3824,7 +3904,10 @@ ${acabat
                 });
             }
 
-            const gdriveId = fullMetaId.split(":")[1];
+            // "gdrive:<id1>:<id2>…" quan el catàleg ha agrupat diverses
+            // còpies de la mateixa pel·lícula (agrupaCopies)
+            const idsCopies = fullMetaId.slice("gdrive:".length).split(":").filter(Boolean);
+            const gdriveId = idsCopies[0];
             const accessToken = await getAccessToken();
             if (!accessToken) {
                 console.error({
@@ -3844,18 +3927,21 @@ ${acabat
             }
             console.log({ message: "File fetched", file });
             const parsedFile = parseFile(file);
-            return createJsonResponse({
-                meta: await createMetaObject(
-                    parsedFile.id,
-                    parsedFile.name,
-                    parsedFile.size,
-                    file.thumbnailLink,
-                    file.createdTime,
-                    // Amb KV la fitxa només llegeix: escriure des d'aquí
-                    // podia desar una còpia vella del mapa per sobre del cron.
-                    { permetResoldre: resolucionsEnCataleg() > 0 }
-                ),
-            });
+            const meta = await createMetaObject(
+                parsedFile.id,
+                parsedFile.name,
+                parsedFile.size,
+                file.thumbnailLink,
+                file.createdTime,
+                // Amb KV la fitxa només llegeix: escriure des d'aquí
+                // podia desar una còpia vella del mapa per sobre del cron.
+                { permetResoldre: resolucionsEnCataleg() > 0 }
+            );
+            if (idsCopies.length > 1) {
+                meta.id = fullMetaId;
+                meta.description = `${idsCopies.length} versions disponibles\n\n${meta.description || ""}`.trim();
+            }
+            return createJsonResponse({ meta });
         }
 
         if (catalogMatch) {
@@ -4022,17 +4108,18 @@ ${acabat
                 await carregaMapa();
 
                 let resoltesAra = 0;
-                const totsMetas = [];
+                const parells = [];
                 for (const file of results.files) {
                     const potResoldre =
                         resoltesAra < resolucionsEnCataleg() && quedaPressupost(6);
                     const abans = PRESSUPOST;
-                    totsMetas.push(await createMetaObject(
+                    parells.push({ file, meta: await createMetaObject(
                         file.id, file.name, file.size, file.thumbnailLink, file.createdTime,
                         { permetResoldre: potResoldre }
-                    ));
+                    ) });
                     if (PRESSUPOST < abans) resoltesAra++;
                 }
+                const totsMetas = agrupaCopies(parells);
 
                 // Pel·lícules i OVAs que viuen dins les carpetes de sèries.
                 // Ja estan resoltes al mapa, així que no costen cap crida.
@@ -4109,18 +4196,18 @@ ${acabat
 
                 await carregaMapa();
                 let resoltesAra = 0;
-                const totsMetas = [];
+                const parells = [];
                 for (const file of results.files.slice(0, 60)) {
                     const potResoldre =
                         resoltesAra < resolucionsEnCataleg() && quedaPressupost(6);
                     const abans = PRESSUPOST;
-                    totsMetas.push(await createMetaObject(
+                    parells.push({ file, meta: await createMetaObject(
                         file.id, file.name, file.size, file.thumbnailLink, file.createdTime,
                         { permetResoldre: potResoldre }
-                    ));
+                    ) });
                     if (PRESSUPOST < abans) resoltesAra++;
                 }
-                const metas = dedupMetas(totsMetas);
+                const metas = dedupMetas(agrupaCopies(parells));
                 await desaMapa(globalThis.__ctx);
 
                 return createJsonResponse({ metas });
@@ -4145,7 +4232,9 @@ ${acabat
         }
 
         if (fullId.startsWith("gdrive:")) {
-            const fileId = streamMatch[2].split(":")[1];
+            // Un o diversos fitxers: "gdrive:<id1>:<id2>…" són còpies de la
+            // mateixa pel·lícula agrupades al catàleg; es llisten totes.
+            const fileIds = fullId.slice("gdrive:".length).split(":").filter(Boolean);
             const accessToken = await getAccessToken();
             if (!accessToken) {
                 console.error({
@@ -4157,20 +4246,25 @@ ${acabat
                 });
             }
 
-            const file = await fetchFile(fileId, accessToken);
-            if (!file) {
+            const fitxers = [];
+            for (const fileId of fileIds.slice(0, 8)) {
+                const file = await fetchFile(fileId, accessToken);
+                if (file) fitxers.push(parseFile(file));
+            }
+            if (fitxers.length === 0) {
                 console.error({
                     message: "Failed to fetch file",
                     error: "File is undefined",
+                    fileIds,
                 });
                 return createJsonResponse({
                     streams: [createErrorStream("Aquest fitxer ja no existeix a Google Drive (esborrat o mogut)")],
                 });
             }
 
-            const parsedFile = parseFile(file);
+            sortParsedFiles(fitxers);
             return createJsonResponse({
-                streams: [createStream(parsedFile, accessToken)],
+                streams: fitxers.map((pf) => createStream(pf, accessToken)),
             });
         }
 
