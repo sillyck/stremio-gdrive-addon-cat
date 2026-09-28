@@ -51,6 +51,9 @@ const CONFIG = {
     // Cada títol pot costar fins a 6 subpeticions (TMDB x3 + Viquipèdia x2).
     // Amb un pressupost de 46 en caben ~7 per invocació.
     maxResolucionsPerPeticio: 7,
+    // Carpetes de sèries que /omplir comprova com a possible franquícia per
+    // passada (1 subpetició cadascuna). Deixa ~30 de pressupost per a TMDB.
+    maxDeteccionsPerPassada: 12,
 
     // Memòria cau del recorregut de col·leccions. Desactivada mentre
     // comprovem els filtres d'extres: així cada petició recorre el Drive de
@@ -100,7 +103,7 @@ const CONFIG = {
 
 // Identificador de la versió del codi. Serveix per verificar via /versio
 // quina versió s'està executant realment al worker.
-const VERSIO_CODI = "2026-09-28.kv-cron-pendents-admin";
+const VERSIO_CODI = "2026-09-28.caratules-a-demanda";
 
 const MANIFEST = {
     id: "stremio.gdrive.worker.cat",
@@ -183,6 +186,9 @@ async function notificaTelegram(text) {
 // l'addon segueixi funcionant sense necessitat de tocar res més.
 const MAPA_URL = "https://gdrive-addon.local/__mapa_v1";
 const MAPA_KV_KEY = "mapa_v1";
+// Resultat desat de detectaFranquicia() per carpeta. El prefix "__" el deixa
+// fora dels recomptes, de /admin i de l'índex d'IMDb.
+const CLAU_FRANQUICIA = "__f:";
 let MAPA = null;          // { [clau]: { imdbId, poster, background, title, ts } }
 let MAPA_BRUT = false;    // hi ha canvis pendents de desar?
 let MAPA_CARREGAT_TS = 0; // quan s'ha llegit per últim cop del persistent
@@ -252,8 +258,11 @@ async function carregaMapa(forcar = false) {
 
 async function desaMapa(ctx) {
     if (!MAPA_BRUT || !MAPA) return;
-    if (MAPA_NO_FIABLE) {
-        console.error({ message: "No es desa el mapa: la lectura havia fallat i el sobreescriuria" });
+    // MAPA_CARREGAT_TS a 0: el mapa en memòria no s'ha llegit mai del
+    // persistent (algú hi ha escrit sobre un null). Desar-lo esborraria tot
+    // el que hi ha.
+    if (MAPA_NO_FIABLE || !MAPA_CARREGAT_TS) {
+        console.error({ message: "No es desa el mapa: no prové d'una lectura correcta i el sobreescriuria" });
         return;
     }
     const kv = kvMapa();
@@ -1609,6 +1618,14 @@ function posterGenerat(titol) {
     return `${globalThis.__origin || ""}/poster?t=${encodeURIComponent(titol || "?")}`;
 }
 
+// Per als títols que el cron encara no ha resolt: la mateixa URL /poster,
+// però amb "r" perquè sigui aquesta petició (una invocació pròpia, amb el
+// seu pressupost) la que busqui a TMDB/IMDb/Viquipèdia i redirigeixi a la
+// caràtula real. El text generat només surt si de debò no es troba.
+function posterADemanda(titol, tipus) {
+    return `${posterGenerat(titol)}&r=${tipus}`;
+}
+
 async function imatgesPerImdb(imdbId) {
     if (!CONFIG.tmdbApiKey || !imdbId) return null;
     if (!quedaPressupost(2) || !consumeix(1)) return null;
@@ -2441,13 +2458,15 @@ async function afinaCarpetaDeSerie(rootFolderId, titols, accessToken) {
 // Abans, el catàleg només creava UNA entrada per carpeta arrel: "Bola de
 // Drac Z/GT/Kai" mai apareixien com a sèries pròpies, encara que hi fossin
 // al Drive — quedaven amagades dins d'una única entrada "Bola de Drac".
+// Retorna null si NO és una franquícia i undefined si no s'ha pogut mirar
+// (sense pressupost o error de Drive): només el primer es pot desar.
 async function detectaFranquicia(rootFolderId, accessToken) {
-    if (!quedaPressupost(6)) return null;
+    if (!quedaPressupost(6)) return undefined;
     let subcarpetes;
     try {
         subcarpetes = await listChildren(rootFolderId, accessToken, { onlyFolders: true });
     } catch (e) {
-        return null;
+        return undefined;
     }
     const utils = subcarpetes.filter((f) => !esCarpetaDExtres(f.name));
     if (utils.length < 2) return null;
@@ -2495,7 +2514,16 @@ async function detectaFranquicia(rootFolderId, accessToken) {
 // de col·leccions: normalment una entrada per subcarpeta directa, però quan
 // detectaFranquicia() hi troba diverses sèries a dins, una entrada per
 // cadascuna (amb tots els ids de carpeta que li pertanyen).
-async function obtenirEntradesDeColleccio(rootId, accessToken) {
+//
+// La detecció costa una crida a Drive per carpeta. Amb ~300 carpetes i el
+// mapa buit es menjava les 50 subpeticions abans d'arribar a TMDB, i com que
+// no es desava res, cada passada tornava a començar igual: el mapa es va
+// quedar a 0 entrades. Ara el resultat es desa ("__f:<id>") i se'n fan com a
+// molt quota.deteccions per crida (compartit entre arrels). El catàleg passa
+// quota 0: mai no detecta, només aprofita el que ja s'ha desat.
+// Cada entrada porta "detectada": /omplir només resol les que ho estan, per
+// no fixar com a sèrie única un contenidor que encara no s'ha mirat.
+async function obtenirEntradesDeColleccio(rootId, accessToken, quota = { deteccions: 0 }) {
     let carpetes = [];
     try {
         carpetes = await listChildren(rootId, accessToken, { onlyFolders: true });
@@ -2511,16 +2539,25 @@ async function obtenirEntradesDeColleccio(rootId, accessToken) {
         // amb /esborra perquè es reavaluïn amb la lògica nova).
         const previ = llegeixMapa("s:" + folder.id);
         if (previ && !calReintentar(previ)) {
-            entrades.push({ ids: [folder.id], nom: folder.name, clau: "s:" + folder.id });
+            entrades.push({ ids: [folder.id], nom: folder.name, clau: "s:" + folder.id, detectada: true });
             continue;
         }
-        const franquicia = await detectaFranquicia(folder.id, accessToken);
+        let franquicia = llegeixMapa(CLAU_FRANQUICIA + folder.id)?.clusters;   // undefined: no mirada
+        if (franquicia === undefined && quota.deteccions > 0) {
+            quota.deteccions--;
+            const d = await detectaFranquicia(folder.id, accessToken);
+            if (d !== undefined) {
+                franquicia = d;
+                escriuMapa(CLAU_FRANQUICIA + folder.id, { clusters: d });
+            }
+        }
+        const detectada = franquicia !== undefined;
         if (franquicia) {
             for (const f of franquicia) {
-                entrades.push({ ids: f.ids, nom: f.nom, clau: "s:" + f.ids.join("+") });
+                entrades.push({ ids: f.ids, nom: f.nom, clau: "s:" + f.ids.join("+"), detectada });
             }
         } else {
-            entrades.push({ ids: [folder.id], nom: folder.name, clau: "s:" + folder.id });
+            entrades.push({ ids: [folder.id], nom: folder.name, clau: "s:" + folder.id, detectada });
         }
     }
     return entrades;
@@ -3239,11 +3276,29 @@ async function handleRequest(request) {
             // context— i produïa portades pitjors que no tenir-ne cap.
             // Ara sempre generem una fitxa amb el títol, que almenys és
             // llegible i identifica l'obra.
+            let cacheControl = "public, max-age=86400";
+            const tipus = url.searchParams.get("r");
+            if (tipus) {
+                const r = await getTmdbPosterByName(titol, { preferTv: tipus === "tv" });
+                if (r?.poster) {
+                    return new Response(null, {
+                        status: 302,
+                        headers: {
+                            Location: r.poster,
+                            "Cache-Control": "public, max-age=604800",
+                            "Access-Control-Allow-Origin": "*",
+                        },
+                    });
+                }
+                // Cerca a mitges (quota, TMDB caigut): el text, però que el
+                // client no el desi, perquè la propera vegada es torni a buscar
+                if (r === undefined) cacheControl = "no-store";
+            }
 
             return new Response(pngPortada(titol), {
                 headers: {
                     "Content-Type": "image/png",
-                    "Cache-Control": "public, max-age=86400",
+                    "Cache-Control": cacheControl,
                     "Access-Control-Allow-Origin": "*",
                 },
             });
@@ -3252,17 +3307,22 @@ async function handleRequest(request) {
         if (url.pathname === "/omplir") {
             const accessToken = await getAccessToken();
             if (!accessToken) return createJsonResponse({ error: "Credencials invàlides" }, 500);
-            await carregaMapa();
+            // Amb KV, /omplir és (amb l'admin) l'únic que escriu el mapa: el
+            // rellegim sencer abans de modificar-lo perquè una còpia de fa
+            // menys d'un minut no sobreescrigui una assignació feta a /admin.
+            await carregaMapa(Boolean(kvMapa()));
 
             let resoltes = 0, totalSeries = 0, totalPelis = 0, pendents = 0;
 
             // ── Sèries ────────────────────────────────────────────────────
+            const quota = { deteccions: CONFIG.maxDeteccionsPerPassada };
             for (const rootId of CONFIG.collectionsRootFolderIds) {
                 let entrades = [];
-                try { entrades = await obtenirEntradesDeColleccio(rootId, accessToken); }
+                try { entrades = await obtenirEntradesDeColleccio(rootId, accessToken, quota); }
                 catch (e) { continue; }
                 totalSeries += entrades.length;
                 for (const entrada of entrades) {
+                    if (!entrada.detectada) { pendents++; continue; }
                     const previ = llegeixMapa(entrada.clau);
                     // Un intent fallit NO és definitiu: la lògica de
                     // reconeixement va millorant, així que els reintentem
@@ -3367,7 +3427,7 @@ async function handleRequest(request) {
 
             await desaMapa(null);
 
-            const alMapa = Object.keys(MAPA || {}).length;
+            const alMapa = Object.keys(MAPA || {}).filter((k) => !k.startsWith("__")).length;
             const total = totalSeries + totalPelis;
             const restants = Math.max(0, total - alMapa);
             const acabat = restants === 0 && pendents === 0;
@@ -3454,7 +3514,7 @@ ${acabat
             if (!clau) {
                 return createJsonResponse({ error: "Falta el paràmetre ?clau=s:<id> o ?clau=m:<id>" }, 400);
             }
-            await carregaMapa();
+            await carregaMapa(true);   // rellegit: escriurem el mapa sencer
             const hiEra = !!llegeixMapa(clau);
             if (hiEra) {
                 delete MAPA[clau];
@@ -3670,7 +3730,8 @@ ${acabat
                 name: ambEtiquetaCat(dades?.title || name),
                 type: "movie",
                 posterShape: "poster",
-                poster: dades?.poster || posterGenerat(dades?.title || name),
+                poster: dades?.poster
+                    || (dades ? posterGenerat(dades.title || name) : posterADemanda(name, "pelicula")),
                 background: dades?.background || thumbnail || null,
                 // La sinopsi de TMDB primer (si en tenim), i les dades del
                 // fitxer sempre com a segona línia — abans la descripció
@@ -3689,6 +3750,9 @@ ${acabat
                 });
                 return createJsonResponse({ meta: null }, 400);
             }
+            // Sense això, en un isolate nou el mapa era null i la fitxa sortia
+            // sense caràtula ni sinopsi encara que el títol ja estigués resolt.
+            await carregaMapa();
 
             if (fullMetaId.startsWith("gdriveshow:")) {
                 // Pot dur més d'un id de carpeta separats per "+" quan
@@ -3751,7 +3815,8 @@ ${acabat
                         type: "series",
                         name: ambEtiquetaCat(dades?.title || nomBase),
                         posterShape: "poster",
-                        poster: dades?.poster || posterGenerat(dades?.title || nomBase),
+                        poster: dades?.poster
+                            || (dades ? posterGenerat(dades.title || nomBase) : posterADemanda(nomBase, "tv")),
                         background: dades?.background || null,
                         description: dades?.overview || undefined,
                         videos,
@@ -3785,7 +3850,10 @@ ${acabat
                     parsedFile.name,
                     parsedFile.size,
                     file.thumbnailLink,
-                    file.createdTime
+                    file.createdTime,
+                    // Amb KV la fitxa només llegeix: escriure des d'aquí
+                    // podia desar una còpia vella del mapa per sobre del cron.
+                    { permetResoldre: resolucionsEnCataleg() > 0 }
                 ),
             });
         }
@@ -3813,7 +3881,11 @@ ${acabat
                 const entrades = [];
                 for (const rootId of CONFIG.collectionsRootFolderIds) {
                     try {
-                        entrades.push(...(await obtenirEntradesDeColleccio(rootId, accessToken)));
+                        // Amb KV el catàleg no detecta franquícies (una crida
+                        // a Drive per carpeta; ho fa el cron i ho desa).
+                        entrades.push(...(await obtenirEntradesDeColleccio(
+                            rootId, accessToken, { deteccions: kvMapa() ? 0 : Infinity }
+                        )));
                     } catch (error) {
                         console.error({ message: "No s'han pogut llistar les col·leccions", error: error.toString() });
                     }
@@ -3883,7 +3955,7 @@ ${acabat
                         type: "series",
                         name: ambEtiquetaCat(entrada.nom),
                         posterShape: "poster",
-                        poster: posterGenerat(entrada.nom),
+                        poster: posterADemanda(entrada.nom, "tv"),
                     });
                 }
 
@@ -4040,7 +4112,7 @@ ${acabat
                 const totsMetas = [];
                 for (const file of results.files.slice(0, 60)) {
                     const potResoldre =
-                        resoltesAra < CONFIG.maxResolucionsPerPeticio && quedaPressupost(6);
+                        resoltesAra < resolucionsEnCataleg() && quedaPressupost(6);
                     const abans = PRESSUPOST;
                     totsMetas.push(await createMetaObject(
                         file.id, file.name, file.size, file.thumbnailLink, file.createdTime,

@@ -16,8 +16,9 @@ enabled = true
 [[kv_namespaces]]
 binding = "MAPA_KV"
 
-# Cron Trigger: una passada d'/omplir cada 10 minuts. Cada invocació té 50
-# subpeticions al pla gratuït (~7 títols); 144 passades al dia omplen el
-# catàleg en poques hores i després només hi ha feina quan afegeixes títols.
+# Cron Trigger: una passada d'/omplir cada minut. Cada invocació té 50
+# subpeticions al pla gratuït (~10 títols): el mapa complet (noms, IMDb,
+# sinopsis) s'omple en una o dues hores. Mentrestant les caràtules ja surten
+# bé gràcies a /poster a demanda. Quan està ple, cada passada no fa res.
 [triggers]
-crons = ["*/10 * * * *"]
+crons = ["* * * * *"]

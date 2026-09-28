@@ -115,7 +115,12 @@ function preparaRespostes(x, t, { series = SERIES, pelis = PELIS } = {}) {
         const { queries } = t.cleanTitleForSearch(o.nom);
         const totes = new Set(queries);
         for (const q of queries) totes.add(t.senseAccents(q));
-        for (const q of totes) x.tmdbPerConsulta.set(q, o.tmdb);
+        // Acumula: com TMDB, una consulta pot tornar obres de diverses
+        // carpetes ("Bola de Drac" retorna la sèrie i també "Bola de Drac Z")
+        for (const q of totes) {
+            const previs = x.tmdbPerConsulta.get(q) || [];
+            x.tmdbPerConsulta.set(q, [...previs, ...o.tmdb.filter((r) => !previs.some((p) => p.id === r.id))]);
+        }
         for (const r of o.tmdb) {
             const esperat = o.esperat === undefined ? o.tmdb[0]?.id : o.esperat;
             x.externs.set(r.id, r.id === esperat ? o.imdb : `tt9${r.id}`);
@@ -143,6 +148,19 @@ async function fetchFals(x, u) {
 
     if (tipus === "drive") {
         const q = url.searchParams.get("q") || "";
+        const tots = Object.values(x.drive).filter(Array.isArray).flat();
+        // GET d'un fitxer o carpeta concrets (fetchFile)
+        const directe = !q && /\/files\/([^/]+)$/.exec(url.pathname);
+        if (directe) {
+            const f = tots.find((i) => i.id === decodeURIComponent(directe[1]));
+            return f ? json(f) : json({ error: "not found" }, 404);
+        }
+        // Cerca per nom (gdrive_search)
+        const nom = /name contains '((?:[^'\\]|\\.)*)'/.exec(q);
+        if (nom) {
+            const terme = nom[1].replace(/\\'/g, "'").toLowerCase();
+            return json({ files: tots.filter((f) => f.mimeType.startsWith("video/") && f.name.toLowerCase().includes(terme)) });
+        }
         const pares = [...q.matchAll(/'([^']+)' in parents/g)].map((m) => m[1]);
         let fills = pares.flatMap((p) => x.drive[p] || []);
         if (q.includes(`mimeType = '${FOLDER}'`)) fills = fills.filter((f) => f.mimeType === FOLDER);
@@ -768,6 +786,200 @@ prova("Sense KV el catàleg continua resolent en línia (màxim 7 per petició)"
     const { metas } = await (await crida(iso, x, entorn(null, { ambKv: false }), "/catalog/series/gdrive_collections.json")).json();
     const resoltes = metas.filter((m) => m.id.startsWith("tt")).length;
     assert.ok(resoltes > 0 && resoltes <= 7, `n'ha resolt ${resoltes}`);
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+seccio("Escala real: 300 carpetes amb el mapa buit (el bloqueig de producció)");
+
+// Mateixa escala que el Drive real (296 sèries). Amb 8 carpetes no es veia:
+// la detecció de franquícies (1 crida a Drive per carpeta) es menjava les 50
+// subpeticions abans d'arribar a TMDB, no es desava res i cada passada
+// tornava a començar igual. En producció el mapa es va quedar a 0 entrades.
+function moltesSeries(n, prefix = "Serie Gran") {
+    return Array.from({ length: n }, (_, i) => ({
+        id: `G${i}`, nom: `${prefix} ${i} (2001)`, imdb: `tt77${String(i).padStart(5, "0")}`,
+        tmdb: [{ id: 7000 + i, name: `${prefix} ${i}`, first_air_date: "2001-01-01", poster_path: `/g${i}.jpg`, genre_ids: [16] }],
+    }));
+}
+
+prova("Amb 300 carpetes i el mapa buit, UNA passada del cron ja resol títols", async () => {
+    const grans = moltesSeries(300);
+    const x = xarxaFalsa({ series: grans, pelis: [] });
+    const kv = kvFals();
+    const iso = nouIsolate(x);
+    preparaRespostes(x, iso.t, { series: grans, pelis: [] });
+    await cron(iso, x, entorn(kv));
+    const resoltes = Object.entries(kv.mapa()).filter(([k, v]) => k.startsWith("s:") && v?.imdbId).length;
+    assert.ok(resoltes >= 5, `només n'ha resolt ${resoltes}`);
+    assert.ok(x.perInvocacio <= LIMIT_CLOUDFLARE, `${x.perInvocacio} subpeticions`);
+});
+
+prova("Amb 300 carpetes, el cron les acaba resolent TOTES amb la caràtula correcta", async () => {
+    const grans = moltesSeries(300);
+    const x = xarxaFalsa({ series: grans, pelis: [] });
+    const kv = kvFals();
+    let passades = 0;
+    for (; passades < 80; passades++) {
+        const iso = nouIsolate(x);
+        preparaRespostes(x, iso.t, { series: grans, pelis: [] });
+        await cron(iso, x, entorn(kv));
+        assert.ok(x.perInvocacio <= LIMIT_CLOUDFLARE, `passada ${passades}: ${x.perInvocacio} subpeticions`);
+        const m = kv.mapa();
+        if (grans.every((s) => m["s:" + s.id]?.imdbId)) break;
+    }
+    const m = kv.mapa();
+    const falten = grans.filter((s) => m["s:" + s.id]?.poster !== posterTmdb(s.tmdb[0].poster_path));
+    assert.equal(falten.length, 0, `en falten ${falten.length} després de ${passades} passades`);
+});
+
+prova("Catàleg de 300 carpetes amb el mapa buit: ràpid (≤ 3 crides externes, cap a TMDB)", async () => {
+    const grans = moltesSeries(300);
+    const x = xarxaFalsa({ series: grans, pelis: [] });
+    const iso = nouIsolate(x);
+    preparaRespostes(x, iso.t, { series: grans, pelis: [] });
+    const res = await crida(iso, x, entorn(kvFals()), "/catalog/series/gdrive_collections.json");
+    const { metas } = await res.json();
+    assert.equal(metas.length, 300);
+    assert.equal(x.compta("tmdb"), 0);
+    assert.ok(x.perInvocacio <= 3, `${x.perInvocacio} crides externes per un catàleg`);
+});
+
+prova("Franquícia: la detecció es desa i el catàleg en mostra les sèries per separat", async () => {
+    const extra = {
+        ARREL_SERIES: [{ id: "F_BDD", name: "Bola de Drac", mimeType: FOLDER }],
+        F_BDD: [
+            { id: "F_BDD_1", name: "Bola de Drac", mimeType: FOLDER },
+            { id: "F_BDD_Z", name: "Bola de Drac Z", mimeType: FOLDER },
+        ],
+        F_BDD_1: [], F_BDD_Z: [],
+    };
+    const bdd = [
+        { id: "F_BDD_1", nom: "Bola de Drac", imdb: "tt0088509", tmdb: [{ id: 12609, name: "Bola de Drac", first_air_date: "1986-02-26", poster_path: "/bdd.jpg", genre_ids: [16] }] },
+        { id: "F_BDD_Z", nom: "Bola de Drac Z", imdb: "tt0121220", tmdb: [{ id: 12971, name: "Bola de Drac Z", first_air_date: "1989-04-26", poster_path: "/bddz.jpg", genre_ids: [16] }] },
+    ];
+    const x = xarxaFalsa({ series: [], pelis: [], extra });
+    const kv = kvFals();
+    for (let i = 0; i < 3; i++) {
+        const iso = nouIsolate(x);
+        preparaRespostes(x, iso.t, { series: bdd, pelis: [] });
+        await cron(iso, x, entorn(kv));
+    }
+    const iso = nouIsolate(x);
+    const abansDrive = x.compta("drive");
+    const { metas } = await (await crida(iso, x, entorn(kv), "/catalog/series/gdrive_collections.json")).json();
+    assert.deepEqual(metas.map((m) => m.id).sort(), ["tt0088509", "tt0121220"]);
+    assert.ok(x.compta("drive") - abansDrive <= 1, "el catàleg no ha de tornar a detectar la franquícia");
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+seccio("Caràtula a demanda: els títols encara no resolts mostren la caràtula real");
+
+prova("Catàleg: sèrie encara no resolta → caràtula a demanda (r=tv), no el text generat", async () => {
+    const x = xarxaFalsa();
+    const iso = nouIsolate(x);
+    preparaRespostes(x, iso.t);
+    const { metas } = await (await crida(iso, x, entorn(kvFals()), "/catalog/series/gdrive_collections.json")).json();
+    const tres = metas.find((m) => m.id === "gdriveshow:F_3X3");
+    assert.equal(tres.poster, `${ORIGEN}/poster?t=${encodeURIComponent("3x3 Ulls (1991)")}&r=tv`);
+});
+
+prova("Catàleg: pel·lícula encara no resolta → caràtula a demanda (r=pelicula)", async () => {
+    const x = xarxaFalsa();
+    const iso = nouIsolate(x);
+    preparaRespostes(x, iso.t);
+    const { metas } = await (await crida(iso, x, entorn(kvFals()), "/catalog/movie/gdrive_list.json")).json();
+    const akira = metas.find((m) => m.id === "gdrive:P_AKI");
+    assert.equal(akira.poster, `${ORIGEN}/poster?t=${encodeURIComponent("Akira (1988) [CAT].mkv")}&r=pelicula`);
+});
+
+prova("/poster a demanda → redirigeix a la caràtula real de TMDB", async () => {
+    const x = xarxaFalsa();
+    const iso = nouIsolate(x);
+    preparaRespostes(x, iso.t);
+    const res = await crida(iso, x, entorn(kvFals()), `/poster?t=${encodeURIComponent("3x3 Ulls (1991)")}&r=tv`, { redirect: "manual" });
+    assert.equal(res.status, 302);
+    assert.equal(res.headers.get("Location"), posterTmdb("/3x3.jpg"));
+    assert.match(res.headers.get("Cache-Control") || "", /max-age=\d{5,}/);
+});
+
+prova("/poster a demanda per a una pel·lícula → caràtula real", async () => {
+    const x = xarxaFalsa();
+    const iso = nouIsolate(x);
+    preparaRespostes(x, iso.t);
+    const res = await crida(iso, x, entorn(kvFals()), `/poster?t=${encodeURIComponent("Akira (1988) [CAT].mkv")}&r=pelicula`, { redirect: "manual" });
+    assert.equal(res.headers.get("Location"), posterTmdb("/akira.jpg"));
+});
+
+prova("/poster a demanda d'un títol que no existeix → text generat (només aleshores)", async () => {
+    const x = xarxaFalsa();
+    const iso = nouIsolate(x);
+    preparaRespostes(x, iso.t);
+    const res = await crida(iso, x, entorn(kvFals()), `/poster?t=${encodeURIComponent("Aiura (sub cat)")}&r=tv`, { redirect: "manual" });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("Content-Type"), "image/png");
+});
+
+prova("/poster a demanda amb TMDB caigut → text generat però SENSE memòria cau (es reintentarà)", async () => {
+    const x = xarxaFalsa();
+    const iso = nouIsolate(x);
+    preparaRespostes(x, iso.t);
+    x.tmdbStatus = 429;
+    const res = await crida(iso, x, entorn(kvFals()), `/poster?t=${encodeURIComponent("3x3 Ulls (1991)")}&r=tv`, { redirect: "manual" });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("Cache-Control"), "no-store");
+});
+
+prova("/poster sense r → text generat directe, sense cap crida a TMDB", async () => {
+    const x = xarxaFalsa();
+    const iso = nouIsolate(x);
+    preparaRespostes(x, iso.t);
+    const res = await crida(iso, x, entorn(kvFals()), `/poster?t=Qualsevol`);
+    assert.equal(res.headers.get("Content-Type"), "image/png");
+    assert.equal(x.compta("tmdb"), 0);
+});
+
+prova("Fitxa de sèrie (meta) d'un títol resolt surt amb la seva caràtula, també en un isolate nou", async () => {
+    const x = xarxaFalsa();
+    const kv = await mapaResolt(x);
+    const iso = nouIsolate(x);
+    const { meta } = await (await crida(iso, x, entorn(kv), "/meta/series/gdriveshow:F_3X3.json")).json();
+    assert.equal(meta.poster, posterTmdb("/3x3.jpg"));
+});
+
+prova("Fitxa de pel·lícula (meta) no escriu el mapa (només el cron i l'admin hi escriuen)", async () => {
+    const x = xarxaFalsa();
+    const kv = await mapaResolt(x);
+    const escriptures = kv.escriptures;
+    const iso = nouIsolate(x);
+    await crida(iso, x, entorn(kv), "/meta/movie/gdrive:P_AKI.json");
+    await crida(iso, x, entorn(kv), "/catalog/movie/gdrive_list.json");
+    assert.equal(kv.escriptures, escriptures);
+});
+
+prova("Un isolate amb una fitxa oberta no pot esborrar el que ha resolt el cron", async () => {
+    const x = xarxaFalsa();
+    const kv = kvFals();
+    const iso = nouIsolate(x);
+    preparaRespostes(x, iso.t);
+    await crida(iso, x, entorn(kv), "/meta/movie/gdrive:P_AKI.json");
+    const cronIso = nouIsolate(x);
+    preparaRespostes(x, cronIso.t);
+    await cron(cronIso, x, entorn(kv));
+    const desprésCron = Object.keys(kv.mapa()).length;
+    await crida(iso, x, entorn(kv), "/catalog/movie/gdrive_list.json");
+    assert.ok(Object.keys(kv.mapa()).length >= desprésCron, "el mapa ha perdut entrades");
+});
+
+prova("Cerca amb KV: no resol en línia ni escriu; els no resolts surten amb caràtula a demanda", async () => {
+    const x = xarxaFalsa();
+    const kv = kvFals();
+    const iso = nouIsolate(x);
+    preparaRespostes(x, iso.t);
+    const { metas } = await (await crida(iso, x, entorn(kv), "/catalog/movie/gdrive_search/search=akira.json")).json();
+    assert.ok(metas.length > 0, "la cerca ha de trobar Akira al Drive");
+    assert.equal(kv.escriptures, 0);
+    assert.equal(x.compta("tmdb"), 0);
+    assert.ok(metas.every((m) => m.poster.includes("&r=pelicula")), JSON.stringify(metas.map((m) => m.poster)));
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
